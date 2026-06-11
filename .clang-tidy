@@ -1,3 +1,6 @@
+# concurrency-mt-unsafe is disabled: mua is single-threaded by design (no
+# threads exist anywhere), so getenv-class findings are pure noise. Re-enable
+# if a thread is ever introduced.
 Checks: >
   -*,
   bugprone-*,
@@ -6,6 +9,7 @@ Checks: >
   clang-analyzer-*,
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
   concurrency-*,
+  -concurrency-mt-unsafe,
   misc-*,
   -misc-include-cleaner,
   -misc-unused-parameters,

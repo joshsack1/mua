@@ -30,6 +30,7 @@ configure_file(cmake/versiondef.h.in ${CMAKE_BINARY_DIR}/config/auto/versiondef.
 # visibility keeps internals reachable from test/unit).
 set(MUA_SOURCES
     src/mua/api/private/helpers.c
+    src/mua/log.c
     src/mua/memory.c)
 
 add_library(mua_obj OBJECT ${MUA_SOURCES})
