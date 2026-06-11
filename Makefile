@@ -27,11 +27,19 @@ TEST_ENV = MUA_TEST_LIB=$(BUILD_DIR)/lib/libmua.dylib MUA_PRG=$(BUILD_DIR)/bin/m
 
 ifeq ($(SANITIZE),1)
 SAN_FLAG = -DENABLE_SANITIZERS=ON
+# The ASan runtime must be preloaded into luajit before the test dylib is
+# dlopen'd. SIP strips DYLD_* across busted's /bin/sh launcher, so invoke the
+# (unprotected) luajit binary directly with the local rocks tree on the path.
 ASAN_DYLIB = $(shell cc -print-resource-dir)/lib/darwin/libclang_rt.asan_osx_dynamic.dylib
-UNIT_ENV = DYLD_INSERT_LIBRARIES=$(ASAN_DYLIB)
+LUAJIT_BIN ?= $(shell command -v luajit 2>/dev/null || echo /opt/homebrew/bin/luajit)
+BUSTED_INNER = $(firstword $(wildcard $(HOME)/.luarocks/lib/luarocks/rocks-5.1/busted/*/bin/busted))
+LR_PATH = $(shell luarocks --local --lua-version=5.1 path --lr-path 2>/dev/null)
+LR_CPATH = $(shell luarocks --local --lua-version=5.1 path --lr-cpath 2>/dev/null)
+UNIT_BUSTED = DYLD_INSERT_LIBRARIES=$(ASAN_DYLIB) LUA_PATH="$(LR_PATH);;" \
+	LUA_CPATH="$(LR_CPATH);;" $(LUAJIT_BIN) $(BUSTED_INNER)
 else
 SAN_FLAG = -DENABLE_SANITIZERS=OFF
-UNIT_ENV =
+UNIT_BUSTED = $(BUSTED)
 endif
 
 MAKEFLAGS += --no-print-directory
@@ -51,7 +59,7 @@ build: $(BUILD_DIR)/.ran-cmake
 ifneq ($(TEST_FILE),)
 ifneq ($(filter test/unit/%,$(TEST_FILE)),)
 unittest: build
-	$(TEST_ENV) $(UNIT_ENV) $(BUSTED) --run=unit $(TEST_FILE)
+	$(TEST_ENV) $(UNIT_BUSTED) --run=unit $(TEST_FILE)
 else
 unittest:
 	@echo "unittest: TEST_FILE is not under test/unit -- skipping"
@@ -66,7 +74,7 @@ endif
 else
 unittest: build
 	@if [ -n "$$(find test/unit -name '*_spec.lua' 2>/dev/null)" ]; then \
-		$(TEST_ENV) $(UNIT_ENV) $(BUSTED) --run=unit; \
+		$(TEST_ENV) $(UNIT_BUSTED) --run=unit; \
 	else echo "unittest: no specs yet"; fi
 functionaltest: build
 	@if [ -n "$$(find test/functional -name '*_spec.lua' 2>/dev/null)" ]; then \

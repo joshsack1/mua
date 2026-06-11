@@ -43,7 +43,8 @@ set(MUA_SOURCES
     src/mua/loop.c
     src/mua/lua/state.c
     src/mua/memory.c
-    src/mua/paths.c)
+    src/mua/paths.c
+    src/mua/sse.c)
 
 add_library(mua_obj OBJECT ${MUA_SOURCES})
 set_target_properties(mua_obj PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET
