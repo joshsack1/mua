@@ -63,3 +63,7 @@ target_link_libraries(mua PRIVATE mua_obj)
 add_library(mua_testlib SHARED)
 target_link_libraries(mua_testlib PRIVATE mua_obj)
 set_target_properties(mua_testlib PROPERTIES OUTPUT_NAME mua)
+
+# Test-only fixture: functional stream specs script its wire behavior.
+add_executable(mua_sse_server test/functional/fixtures/sse_server.c)
+target_link_libraries(mua_sse_server PRIVATE mua_obj)

@@ -18,12 +18,13 @@ BUSTED ?= $(shell [ -x $(HOME)/.luarocks/bin/busted ] && echo $(HOME)/.luarocks/
 # Homebrew's clang-tidy does not know Apple's default SDK; pass it explicitly.
 SDKROOT ?= $(shell xcrun --show-sdk-path 2>/dev/null)
 
-C_SOURCES = $(shell find src/mua -name '*.c' 2>/dev/null)
-C_HEADERS = $(shell find src/mua -name '*.h' 2>/dev/null)
+C_SOURCES = $(shell find src/mua test/functional/fixtures -name '*.c' 2>/dev/null)
+C_HEADERS = $(shell find src/mua test/functional/fixtures -name '*.h' 2>/dev/null)
 LUA_LINT_TARGETS = $(wildcard runtime) $(wildcard test) $(wildcard .busted)
 STYLUA_TARGETS = $(wildcard runtime) $(wildcard test)
 
-TEST_ENV = MUA_TEST_LIB=$(BUILD_DIR)/lib/libmua.dylib MUA_PRG=$(BUILD_DIR)/bin/mua
+TEST_ENV = MUA_TEST_LIB=$(BUILD_DIR)/lib/libmua.dylib MUA_PRG=$(BUILD_DIR)/bin/mua \
+	MUA_SSE_SERVER=$(BUILD_DIR)/bin/mua_sse_server
 
 ifeq ($(SANITIZE),1)
 SAN_FLAG = -DENABLE_SANITIZERS=ON
