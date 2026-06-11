@@ -12,10 +12,33 @@ mua is a minimal coding agent — the feature class of [zot](https://github.com/
 
 Planned order; nothing below exists yet:
 
-1. **Agent milestone**, in dependency order: session store (message data model in C + append-only JSONL under `~/.local/state/mua/sessions/`, plus the deferred ensure-dir in paths.c — design the types as the future `mua_sess_*` vocabulary so the API layer is a formalization, not a refactor) → provider tool-calling (OpenAI-compatible `tools`, streaming `tool_calls` delta accumulation) → the four built-in tools (`bash` via `uv_spawn` with the mandatory timeout, bounded output capture) → the agent loop with the 50-step cap → a minimal line-based REPL (no TUI yet).
+1. **Agent milestone** — sessions, tool calling, the four built-in tools, the agent loop, a line-based REPL. Spans many commits; tracked as its own section below.
 2. **`mua.api` + Lua bridge** — the identity feature, after the agent exists so it wraps settled behavior: `src/mua/api/{global,session,tools}.c` with `FUNC_API_SINCE` and table-driven dispatch, mechanical `mua.api.mua_*` registration, the autocmd event set, `mua_register_tool` from Lua, and the `mua.o`/`mua.g` sugar in `runtime/lua/mua/`.
 
 Housekeeping, slotted whenever: CI running the full gauntlet (`make && make test && make lint` plus the `SANITIZE=1` suites); a LICENSE decision before the repo goes public (none exists yet, deliberately; Apache-2.0 would match neovim); a `MUA_HTTP_STALL_WINDOW_S` env override so stall detection becomes functionally testable against the fixture server.
+
+## Agent milestone
+
+Turns mua from a streaming client into an agent. Too large for one context window — execute the commits below in order, one or a few per session, each green on the full gauntlet (`make && make test && make lint`, format-stable, no co-author trailers; run `make BUILD_DIR=build-san SANITIZE=1 test` after the tool/loop commits). **Full design: [docs/agent-milestone.md](docs/agent-milestone.md)** — read it before executing a commit; it carries the module surfaces, caps, wire-format reference, and per-commit test matrix. main.c is rewritten once, at commit 8 (commit 3 does a minimal migration so `-p` keeps working mid-milestone).
+
+- [ ] 1. `feat(core): recursive ensure-dir in paths` — `paths_ensure_dir` (mkdir -p, 0700) + paths_spec
+- [ ] 2. `feat(session): append-only jsonl session store` — session.{c,h}, CMake entry, move shared cJSON cdefs into test/unit/helpers.lua, session_spec
+- [ ] 3. `feat(provider): tool calling with streamed tool_call accumulation` — openrouter v2 + seam changes + `start_attempt` full-reset fix + minimal main.c migration + openrouter_spec (verify once against a live tool call via `op run`)
+- [ ] 4. `feat(tools): registry, result contract, and the read tool` + tools_spec
+- [ ] 5. `feat(tools): write and edit with exact-match replacement`
+- [ ] 6. `feat(tools): bash via uv_spawn with mandatory timeout and bounded capture`
+- [ ] 7. `feat(agent): turn loop with step cap, tool gate, and cancellation` — agent.{c,h} + `loop_run_nowait`
+- [ ] 8. `feat(cli): line-based repl, sessions, --resume, and one-shot agent turns` — main.c rewrite + helpers `stdin=`/`MUA_STATE_DIR` + resume_spec + functional matrix
+- [ ] 9. `docs: agent milestone state and commands` — tick this list, update Current state + README, retire the heading once all boxes are checked
+
+**Load-bearing contracts (do not re-litigate; the design depends on each):**
+
+1. Messages are wire-shaped `cJSON`; the session owns the conversation array; build request bodies zero-copy with `cJSON_CreateArrayReference(messages->child)` (the array's first element, not the array node — verified against vendored cJSON 1.7.18).
+2. `session_append(SessionState *, cJSON *msg, Error *)` takes ownership of `msg` unconditionally (frees even on failure); appended nodes stay borrowable until `session_free`.
+3. Provider `on_done(ud, cJSON *message, finish_reason, tokens)` transfers ownership of the assembled wire-shaped assistant message; the `messages`/`tools` opts are borrowed only for the `openrouter_stream` call.
+4. Tool failures are `ToolResult{is_error}`, never `Error *`; one async execute contract (sync tools fire `done` inline); the registry shape (name/description/schema/callback) is the seed of `mua_register_tool`.
+5. The agent gate is a single function-pointer chokepoint (the future Lua `ToolPre` hook wraps it); a dangling `tool_calls` message must always be answered with results (synthetic ones on refuse/cancel/resume) or every resumed request 400s.
+6. Tool-call detection: a nonempty `tool_calls` array is authoritative over the `finish_reason` string; the 50-step cap stops the turn, never loops.
 
 ## Hard rules
 
