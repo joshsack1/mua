@@ -18,6 +18,13 @@ ffi.cdef([[
   typedef struct { ErrorType type; char *msg; } Error;
   void xfree(void *ptr);
   void api_clear_error(Error *err);
+
+  typedef struct uv_loop_s uv_loop_t;
+  bool loop_init(void);
+  uv_loop_t *loop_get(void);
+  int loop_run(void);
+  void loop_stop(void);
+  bool loop_close(void);
 ]])
 
 --- ffi.cdef that tolerates re-definition: spec files share one busted process,

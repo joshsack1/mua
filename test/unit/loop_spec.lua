@@ -1,15 +1,7 @@
 local t = require("test.unit.helpers")
 local lib = t.lib
 
--- Declarations mirror src/mua/loop.h.
-t.cdef([[
-  typedef struct uv_loop_s uv_loop_t;
-  bool loop_init(void);
-  uv_loop_t *loop_get(void);
-  int loop_run(void);
-  void loop_stop(void);
-  bool loop_close(void);
-]])
+-- loop.h declarations are shared via helpers (http_spec needs them too).
 
 describe("loop singleton", function()
   it("init / get / run / close roundtrip", function()
