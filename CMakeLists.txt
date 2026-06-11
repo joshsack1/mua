@@ -25,6 +25,14 @@ pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl>=7.87)
 set(MUA_VERSION_PRERELEASE "-dev")
 configure_file(cmake/versiondef.h.in ${CMAKE_BINARY_DIR}/config/auto/versiondef.h)
 
+# Vendored cJSON: own target, no mua warning flags, SYSTEM include so -Werror
+# never fires on its header. CJSON_NESTING_LIMIT bounds its parse recursion.
+add_library(cjson STATIC src/cjson/cJSON.c)
+target_compile_options(cjson PRIVATE -w)
+target_compile_definitions(cjson PUBLIC CJSON_NESTING_LIMIT=64)
+target_include_directories(cjson SYSTEM INTERFACE ${PROJECT_SOURCE_DIR}/src)
+set_target_properties(cjson PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # Everything except main.c compiles once into an object library that feeds
 # both the executable and a shared library for FFI unit tests (default symbol
 # visibility keeps internals reachable from test/unit).
@@ -39,7 +47,7 @@ set(MUA_SOURCES
 add_library(mua_obj OBJECT ${MUA_SOURCES})
 set_target_properties(mua_obj PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET
                                                                       default)
-target_link_libraries(mua_obj PUBLIC mua_flags PkgConfig::LIBUV PkgConfig::LUAJIT)
+target_link_libraries(mua_obj PUBLIC mua_flags cjson PkgConfig::LIBUV PkgConfig::LUAJIT)
 target_include_directories(mua_obj PUBLIC ${PROJECT_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/config)
 # Dev-build default runtime location; installs will need a relocatable story.
 target_compile_definitions(mua_obj PRIVATE MUA_RUNTIME_PATH="${PROJECT_SOURCE_DIR}/runtime")
