@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 mua is a minimal coding agent — the feature class of [zot](https://github.com/patriceckhart/zot) and [pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent): an agent loop, four built-in tools (read/write/edit/bash), an LLM provider, persisted sessions — built in the style of [neovim](https://github.com/neovim/neovim): a C core embedding LuaJIT, with all configuration and extension done in Lua. The differentiator is the API surface: the exposed C API must feel immediately familiar to anyone who has spent serious time with neovim's `src/nvim/api/` or `vim.api`.
 
-**Current state: greenfield.** The repo has no commits yet; this file is the founding spec. As scaffolding lands, keep the Commands section in sync with what actually exists — never list a target here that doesn't run.
+**Current state: C infrastructure scaffolded.** The build system, base layer (memory/api types/loop/log/paths), minimal LuaJIT embed (init.lua evaluation; no `mua.api` bridge yet), bounded JSON wrapper over vendored cJSON, the chunk-split-invariant SSE decoder, the curl_multi⇄libuv HTTP client, and the OpenRouter streaming provider all exist: `mua -p "prompt"` streams a completion. Still to come: the agent loop, the four built-in tools, sessions, and the `mua.api` surface. Keep the Commands section in sync with what actually exists — never list a target here that doesn't run.
 
 ## Hard rules
 
@@ -24,7 +24,8 @@ make unittest         # C-internal tests (busted + LuaJIT FFI, neovim test/unit 
 make functionaltest   # end-to-end Lua specs driving the built binary (test/functional/)
 make lint             # clang-tidy on C, luacheck on Lua
 make format           # clang-format on C, stylua on Lua
-TEST_FILE=test/functional/agent_spec.lua make functionaltest   # run a single spec file
+TEST_FILE=test/functional/startup_spec.lua make functionaltest   # run a single spec file
+make SANITIZE=1 BUILD_DIR=build-san test   # the suites under ASan+UBSan (second gear)
 ```
 
 CMake never invoked directly except for debugging the build itself. Dependencies (LuaJIT, libuv, libcurl) are found on the system first; a `cmake.deps`-style bundled fallback can come later if needed.
