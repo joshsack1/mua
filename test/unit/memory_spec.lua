@@ -2,7 +2,7 @@ local t = require("test.unit.helpers")
 local ffi = t.ffi
 local lib = t.lib
 
--- Declarations mirror src/mua/memory.h.
+-- Declarations mirror src/mua/memory.h (xfree comes from helpers).
 t.cdef([[
   void *xmalloc(size_t size);
   void *xcalloc(size_t count, size_t size);
@@ -10,7 +10,6 @@ t.cdef([[
   char *xstrdup(const char *str);
   char *xstrndup(const char *str, size_t n);
   void *xmemdup(const void *data, size_t len);
-  void xfree(void *ptr);
 
   typedef struct arena_block ArenaBlock;
   typedef struct { ArenaBlock *current; size_t offset; } Arena;

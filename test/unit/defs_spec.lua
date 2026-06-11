@@ -2,14 +2,9 @@ local t = require("test.unit.helpers")
 local ffi = t.ffi
 local lib = t.lib
 
--- Declarations mirror src/mua/api/private/defs.h and helpers.h.
+-- Declarations mirror src/mua/api/private/helpers.h (types come from helpers).
 t.cdef([[
-  typedef struct { char *data; size_t size; } String;
-  typedef enum { kErrorTypeNone = -1, kErrorTypeException, kErrorTypeValidation } ErrorType;
-  typedef struct { ErrorType type; char *msg; } Error;
-
   void api_set_error(Error *err, ErrorType type, const char *fmt, ...);
-  void api_clear_error(Error *err);
   String cstr_to_string(const char *str);
   String cstr_as_string(const char *str);
   void api_free_string(String str);
