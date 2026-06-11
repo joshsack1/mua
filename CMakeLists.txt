@@ -25,6 +25,21 @@ pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl>=7.87)
 set(MUA_VERSION_PRERELEASE "-dev")
 configure_file(cmake/versiondef.h.in ${CMAKE_BINARY_DIR}/config/auto/versiondef.h)
 
+# Everything except main.c compiles once into an object library that feeds
+# both the executable and a shared library for FFI unit tests (default symbol
+# visibility keeps internals reachable from test/unit).
+set(MUA_SOURCES
+    src/mua/memory.c)
+
+add_library(mua_obj OBJECT ${MUA_SOURCES})
+set_target_properties(mua_obj PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET
+                                                                      default)
+target_link_libraries(mua_obj PUBLIC mua_flags)
+target_include_directories(mua_obj PUBLIC ${PROJECT_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/config)
+
 add_executable(mua src/mua/main.c)
-target_link_libraries(mua PRIVATE mua_flags)
-target_include_directories(mua PRIVATE ${PROJECT_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/config)
+target_link_libraries(mua PRIVATE mua_obj)
+
+add_library(mua_testlib SHARED)
+target_link_libraries(mua_testlib PRIVATE mua_obj)
+set_target_properties(mua_testlib PROPERTIES OUTPUT_NAME mua)

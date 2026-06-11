@@ -12,7 +12,9 @@ CLANG_FORMAT ?= clang-format
 CLANG_TIDY ?= $(shell command -v clang-tidy 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/clang-tidy)
 STYLUA ?= stylua
 LUACHECK ?= luacheck
-BUSTED ?= $(shell command -v busted 2>/dev/null || echo $(HOME)/.luarocks/bin/busted)
+# Prefer the user-local tree: the README's bootstrap pairs it with LuaJIT,
+# while a system-tree busted may be paired with plain Lua (no ffi).
+BUSTED ?= $(shell [ -x $(HOME)/.luarocks/bin/busted ] && echo $(HOME)/.luarocks/bin/busted || command -v busted 2>/dev/null || echo busted)
 # Homebrew's clang-tidy does not know Apple's default SDK; pass it explicitly.
 SDKROOT ?= $(shell xcrun --show-sdk-path 2>/dev/null)
 
