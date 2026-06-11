@@ -1,0 +1,23 @@
+BasedOnStyle: LLVM
+IndentWidth: 2
+ColumnLimit: 100
+ContinuationIndentWidth: 2
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterFunction: true
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: false
+PointerAlignment: Right
+SpaceAfterCStyleCast: false
+AlignAfterOpenBracket: Align
+IndentCaseLabels: true
+InsertBraces: true
+SortIncludes: CaseSensitive
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^<(uv|curl|lua|lauxlib|lualib|luajit|cjson)'
+    Priority: 2
+  - Regex: '^<'
+    Priority: 1
+  - Regex: '^"'
+    Priority: 3

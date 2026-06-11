@@ -1,0 +1,11 @@
+return {
+  _all = {
+    lpath = "./?.lua",
+  },
+  unit = {
+    ROOT = { "test/unit" },
+  },
+  functional = {
+    ROOT = { "test/functional" },
+  },
+}

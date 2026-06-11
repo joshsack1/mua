@@ -1,0 +1,23 @@
+local helpers = require("test.functional.helpers")
+
+describe("mua CLI", function()
+  it("--version prints the version and exits 0", function()
+    local r = helpers.run_mua({ "--version" })
+    assert.equal(0, r.code)
+    assert.truthy(r.stdout:match("^mua v%d+%.%d+%.%d+"))
+  end)
+
+  it("--help prints usage and exits 0", function()
+    local r = helpers.run_mua({ "--help" })
+    assert.equal(0, r.code)
+    assert.truthy(r.stdout:match("^Usage:"))
+  end)
+
+  it("rejects unknown flags with usage on stderr and exit 64", function()
+    local r = helpers.run_mua({ "--bogus" })
+    assert.equal(64, r.code)
+    assert.truthy(r.stderr:match("unknown argument"))
+    assert.truthy(r.stderr:match("Usage:"))
+    assert.equal("", r.stdout)
+  end)
+end)

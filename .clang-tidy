@@ -1,0 +1,22 @@
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  cert-*,
+  clang-analyzer-*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  concurrency-*,
+  misc-*,
+  -misc-include-cleaner,
+  -misc-unused-parameters,
+  performance-*,
+  portability-*,
+  readability-function-size,
+  readability-braces-around-statements,
+  readability-misleading-indentation,
+  readability-duplicate-include
+WarningsAsErrors: '*'
+HeaderFilterRegex: 'src/mua/'
+FormatStyle: file
+CheckOptions:
+  readability-function-size.LineThreshold: 80
