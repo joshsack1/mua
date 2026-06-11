@@ -6,7 +6,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 mua is a minimal coding agent — the feature class of [zot](https://github.com/patriceckhart/zot) and [pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent): an agent loop, four built-in tools (read/write/edit/bash), an LLM provider, persisted sessions — built in the style of [neovim](https://github.com/neovim/neovim): a C core embedding LuaJIT, with all configuration and extension done in Lua. The differentiator is the API surface: the exposed C API must feel immediately familiar to anyone who has spent serious time with neovim's `src/nvim/api/` or `vim.api`.
 
-**Current state: C infrastructure scaffolded.** The build system, base layer (memory/api types/loop/log/paths), minimal LuaJIT embed (init.lua evaluation; no `mua.api` bridge yet), bounded JSON wrapper over vendored cJSON, the chunk-split-invariant SSE decoder, the curl_multi⇄libuv HTTP client, and the OpenRouter streaming provider all exist: `mua -p "prompt"` streams a completion. Still to come: the agent loop, the four built-in tools, sessions, and the `mua.api` surface. Keep the Commands section in sync with what actually exists — never list a target here that doesn't run.
+**Current state: C infrastructure scaffolded.** The build system, base layer (memory/api types/loop/log/paths), minimal LuaJIT embed (init.lua evaluation; no `mua.api` bridge yet), bounded JSON wrapper over vendored cJSON, the chunk-split-invariant SSE decoder, the curl_multi⇄libuv HTTP client, and the OpenRouter streaming provider all exist: `mua -p "prompt"` streams a completion. Still to come: see the Roadmap below. Keep the Commands section in sync with what actually exists — never list a target here that doesn't run.
+
+## Roadmap
+
+Planned order; nothing below exists yet:
+
+1. **SSE fixture server** — test-only C-on-libuv binary (`test/functional/fixtures/sse_server.c`) speaking plain HTTP/1.1 on localhost with scripted `send N / sleep ms / close` wire control, so functional tests can force chunk boundaries, stalls, and abrupt closes. Specs point `OPENROUTER_BASE_URL` at it (already supported — zero provider changes). Converts the curl⇄libuv bridge from smoke-tested to regression-tested.
+2. **Agent milestone**, in dependency order: session store (message data model in C + append-only JSONL under `~/.local/state/mua/sessions/`, plus the deferred ensure-dir in paths.c — design the types as the future `mua_sess_*` vocabulary so the API layer is a formalization, not a refactor) → provider tool-calling (OpenAI-compatible `tools`, streaming `tool_calls` delta accumulation) → the four built-in tools (`bash` via `uv_spawn` with the mandatory timeout, bounded output capture) → the agent loop with the 50-step cap → a minimal line-based REPL (no TUI yet).
+3. **`mua.api` + Lua bridge** — the identity feature, after the agent exists so it wraps settled behavior: `src/mua/api/{global,session,tools}.c` with `FUNC_API_SINCE` and table-driven dispatch, mechanical `mua.api.mua_*` registration, the autocmd event set, `mua_register_tool` from Lua, and the `mua.o`/`mua.g` sugar in `runtime/lua/mua/`.
+
+Housekeeping, slotted whenever: CI running the full gauntlet (`make && make test && make lint` plus the `SANITIZE=1` suites), and a LICENSE decision before the repo goes public (none exists yet, deliberately; Apache-2.0 would match neovim).
 
 ## Hard rules
 
