@@ -50,6 +50,8 @@ typedef struct {
 // Performs curl_global_init on first use.
 HttpClient *http_client_new(uv_loop_t *loop, Error *err);
 
+uv_loop_t *http_client_loop(const HttpClient *client);
+
 // Cancels every in-flight request (their on_complete callbacks fire), then
 // tears down asynchronously: run the loop afterwards to drain handle closes.
 void http_client_close(HttpClient *client);

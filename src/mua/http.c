@@ -343,6 +343,11 @@ void http_client_close(HttpClient *client)
   uv_close((uv_handle_t *)&client->reap_timer, client_handle_closed);
 }
 
+uv_loop_t *http_client_loop(const HttpClient *client)
+{
+  return client->loop;
+}
+
 void http_global_cleanup(void)
 {
   if (g_curl_initialized) {
