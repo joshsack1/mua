@@ -29,6 +29,7 @@ configure_file(cmake/versiondef.h.in ${CMAKE_BINARY_DIR}/config/auto/versiondef.
 # both the executable and a shared library for FFI unit tests (default symbol
 # visibility keeps internals reachable from test/unit).
 set(MUA_SOURCES
+    src/mua/api/private/helpers.c
     src/mua/memory.c)
 
 add_library(mua_obj OBJECT ${MUA_SOURCES})
