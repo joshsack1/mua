@@ -32,13 +32,14 @@ set(MUA_SOURCES
     src/mua/api/private/helpers.c
     src/mua/log.c
     src/mua/loop.c
+    src/mua/lua/state.c
     src/mua/memory.c
     src/mua/paths.c)
 
 add_library(mua_obj OBJECT ${MUA_SOURCES})
 set_target_properties(mua_obj PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET
                                                                       default)
-target_link_libraries(mua_obj PUBLIC mua_flags PkgConfig::LIBUV)
+target_link_libraries(mua_obj PUBLIC mua_flags PkgConfig::LIBUV PkgConfig::LUAJIT)
 target_include_directories(mua_obj PUBLIC ${PROJECT_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/config)
 # Dev-build default runtime location; installs will need a relocatable story.
 target_compile_definitions(mua_obj PRIVATE MUA_RUNTIME_PATH="${PROJECT_SOURCE_DIR}/runtime")

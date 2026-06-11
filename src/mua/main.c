@@ -3,6 +3,9 @@
 #include <string.h>
 
 #include "auto/versiondef.h"
+#include "mua/log.h"
+#include "mua/loop.h"
+#include "mua/lua/state.h"
 
 enum {
   kExitOk = 0,
@@ -39,6 +42,31 @@ static bool parse_args(int argc, char **argv, MuaArgs *out)
   return true;
 }
 
+static int run(void)
+{
+  if (!loop_init()) {
+    (void)fprintf(stderr, "mua: failed to initialize event loop\n");
+    return kExitFailure;
+  }
+  int code = kExitOk;
+  if (!mua_lua_init()) {
+    (void)fprintf(stderr, "mua: failed to initialize lua\n");
+    code = kExitFailure;
+  } else {
+    // Broken user config is nonfatal by contract; sourcing only fails on
+    // internal errors.
+    if (!mua_lua_source_init()) {
+      (void)fprintf(stderr, "mua: failed to source init.lua\n");
+      code = kExitFailure;
+    }
+  }
+  mua_lua_teardown();
+  if (!loop_close()) {
+    code = kExitFailure;
+  }
+  return code;
+}
+
 int main(int argc, char **argv)
 {
   MuaArgs args;
@@ -56,6 +84,6 @@ int main(int argc, char **argv)
     }
     return kExitOk;
   }
-  // Nothing to do yet: startup wiring lands with the core modules.
-  return kExitOk;
+  log_init();
+  return run();
 }
