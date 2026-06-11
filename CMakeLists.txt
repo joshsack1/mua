@@ -31,12 +31,13 @@ configure_file(cmake/versiondef.h.in ${CMAKE_BINARY_DIR}/config/auto/versiondef.
 set(MUA_SOURCES
     src/mua/api/private/helpers.c
     src/mua/log.c
+    src/mua/loop.c
     src/mua/memory.c)
 
 add_library(mua_obj OBJECT ${MUA_SOURCES})
 set_target_properties(mua_obj PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET
                                                                       default)
-target_link_libraries(mua_obj PUBLIC mua_flags)
+target_link_libraries(mua_obj PUBLIC mua_flags PkgConfig::LIBUV)
 target_include_directories(mua_obj PUBLIC ${PROJECT_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/config)
 
 add_executable(mua src/mua/main.c)
