@@ -73,12 +73,51 @@ local function run_tool(def, args_json)
   return captured
 end
 
+-- Shared filesystem fixture for every tool describe below.
+local root
+
+local function write_file(name, data)
+  local path = root .. "/" .. name
+  local f = assert(io.open(path, "wb"))
+  f:write(data)
+  f:close()
+  return path
+end
+
+local function read_back(path)
+  local f = assert(io.open(path, "rb"))
+  local data = f:read("*a")
+  f:close()
+  return data
+end
+
+before_each(function()
+  root = os.tmpname()
+  os.remove(root)
+  assert(os.execute('mkdir -p "' .. root .. '"'))
+end)
+
+after_each(function()
+  -- The unwritable-parent test leaves a 0500 dir; unlock before deleting.
+  os.execute('chmod -R u+rwx "' .. root .. '" 2>/dev/null')
+  os.execute('rm -rf "' .. root .. '"')
+end)
+
 describe("tools registry", function()
   it("looks up read with the right flags", function()
     local def = lib.tools_lookup("read")
     assert.is_true(def ~= nil)
     assert.equal("read", ffi.string(def.name))
     assert.is_false(def.mutating)
+  end)
+
+  it("write and edit are registered as mutating", function()
+    for _, name in ipairs({ "write", "edit" }) do
+      local def = lib.tools_lookup(name)
+      assert.is_true(def ~= nil)
+      assert.equal(name, ffi.string(def.name))
+      assert.is_true(def.mutating)
+    end
   end)
 
   it("returns NULL for unknown or NULL names", function()
@@ -93,38 +132,22 @@ describe("tools registry", function()
     assert.equal(ffi.C.kErrorTypeNone, err.type)
     local s = printed(arr)
     lib.json_free(arr)
-    assert.truthy(s:find('"type":"function"', 1, true))
+    assert.equal(3, select(2, s:gsub('"type":"function"', "")))
     assert.truthy(s:find('"name":"read"', 1, true))
+    assert.truthy(s:find('"name":"write"', 1, true))
+    assert.truthy(s:find('"name":"edit"', 1, true))
     assert.truthy(s:find('"required":["path"]', 1, true))
+    assert.truthy(s:find('"required":["path","old_string","new_string"]', 1, true))
     lib.json_free(parse(s)) -- round-trip: the printed array re-parses
   end)
 end)
 
 describe("read tool", function()
   local def = lib.tools_lookup("read")
-  local root
-
-  local function write_file(name, data)
-    local path = root .. "/" .. name
-    local f = assert(io.open(path, "wb"))
-    f:write(data)
-    f:close()
-    return path
-  end
 
   local function read_args(path, extra)
     return '{"path":"' .. path .. '"' .. (extra or "") .. "}"
   end
-
-  before_each(function()
-    root = os.tmpname()
-    os.remove(root)
-    assert(os.execute('mkdir -p "' .. root .. '"'))
-  end)
-
-  after_each(function()
-    os.execute('rm -rf "' .. root .. '"')
-  end)
 
   it("returns a whole file verbatim", function()
     local path = write_file("f.txt", "l1\nl2\nl3\n")
@@ -217,5 +240,180 @@ describe("read tool", function()
     assert.truthy(zero_offset.content:find("integers >= 1", 1, true))
     local bad_limit = run_tool(def, read_args(path, ',"limit":"x"'))
     assert.is_true(bad_limit.is_error)
+  end)
+end)
+
+describe("write tool", function()
+  local def = lib.tools_lookup("write")
+
+  local function write_args(path, content)
+    return '{"path":"' .. path .. '","content":"' .. content .. '"}'
+  end
+
+  it("writes a file and reports the byte count", function()
+    local path = root .. "/f.txt"
+    local r = run_tool(def, write_args(path, "hello world"))
+    assert.is_false(r.is_error)
+    assert.equal("write: wrote 11 bytes to " .. path, r.content)
+    assert.equal("hello world", read_back(path))
+  end)
+
+  it("creates nested parent directories", function()
+    local path = root .. "/a/b/c/f.txt"
+    local r = run_tool(def, write_args(path, "deep"))
+    assert.is_false(r.is_error)
+    assert.equal("deep", read_back(path))
+  end)
+
+  it("replaces existing contents entirely", function()
+    local path = write_file("f.txt", "a much longer original body\n")
+    local r = run_tool(def, write_args(path, "short"))
+    assert.is_false(r.is_error)
+    assert.equal("short", read_back(path))
+  end)
+
+  it("writes an empty file for empty content", function()
+    local path = root .. "/f.txt"
+    local r = run_tool(def, write_args(path, ""))
+    assert.is_false(r.is_error)
+    assert.equal("write: wrote 0 bytes to " .. path, r.content)
+    assert.equal("", read_back(path))
+  end)
+
+  it("errors on a directory path", function()
+    local r = run_tool(def, write_args(root, "x"))
+    assert.is_true(r.is_error)
+    assert.truthy(r.content:find("cannot open", 1, true))
+  end)
+
+  it("errors on an unwritable parent", function()
+    assert(os.execute('mkdir -p "' .. root .. '/locked" && chmod 0500 "' .. root .. '/locked"'))
+    local r = run_tool(def, write_args(root .. "/locked/f.txt", "x"))
+    assert.is_true(r.is_error)
+  end)
+
+  it("requires string path and content", function()
+    local no_content = run_tool(def, '{"path":"' .. root .. '/f.txt"}')
+    assert.is_true(no_content.is_error)
+    assert.truthy(no_content.content:find("content is required", 1, true))
+    local bad_content = run_tool(def, '{"path":"' .. root .. '/f.txt","content":42}')
+    assert.is_true(bad_content.is_error)
+    local no_path = run_tool(def, '{"content":"x"}')
+    assert.is_true(no_path.is_error)
+  end)
+end)
+
+describe("edit tool", function()
+  local def = lib.tools_lookup("edit")
+
+  local function edit_args(path, old, new)
+    return '{"path":"' .. path .. '","old_string":"' .. old .. '","new_string":"' .. new .. '"}'
+  end
+
+  it("replaces a unique occurrence and reports it", function()
+    local path = write_file("f.txt", "before MARK after\n")
+    local r = run_tool(def, edit_args(path, "MARK", "X"))
+    assert.is_false(r.is_error)
+    assert.equal("edit: replaced 1 occurrence in " .. path, r.content)
+    assert.equal("before X after\n", read_back(path))
+  end)
+
+  it("errors when old_string is not found", function()
+    local path = write_file("f.txt", "abc\n")
+    local r = run_tool(def, edit_args(path, "zzz", "x"))
+    assert.is_true(r.is_error)
+    assert.truthy(r.content:find("not found", 1, true))
+    assert.equal("abc\n", read_back(path))
+  end)
+
+  it("errors with the count on multiple occurrences", function()
+    local path = write_file("f.txt", "dup one dup two dup\n")
+    local r = run_tool(def, edit_args(path, "dup", "x"))
+    assert.is_true(r.is_error)
+    assert.truthy(r.content:find("occurs 3 times", 1, true))
+    assert.equal("dup one dup two dup\n", read_back(path))
+  end)
+
+  it("counts overlapping matches and refuses them", function()
+    local path = write_file("f.txt", "aaa")
+    local r = run_tool(def, edit_args(path, "aa", "b"))
+    assert.is_true(r.is_error)
+    assert.truthy(r.content:find("occurs 2 times", 1, true))
+  end)
+
+  it("rejects empty and identical old/new strings", function()
+    local path = write_file("f.txt", "abc\n")
+    local empty_old = run_tool(def, edit_args(path, "", "x"))
+    assert.is_true(empty_old.is_error)
+    assert.truthy(empty_old.content:find("old_string is empty", 1, true))
+    local same = run_tool(def, edit_args(path, "abc", "abc"))
+    assert.is_true(same.is_error)
+    assert.truthy(same.content:find("identical", 1, true))
+    local missing_new = run_tool(def, '{"path":"' .. path .. '","old_string":"abc"}')
+    assert.is_true(missing_new.is_error)
+  end)
+
+  it("deletes the match when new_string is empty", function()
+    local path = write_file("f.txt", "keep CUT keep\n")
+    local r = run_tool(def, edit_args(path, " CUT", ""))
+    assert.is_false(r.is_error)
+    assert.equal("keep keep\n", read_back(path))
+  end)
+
+  it("matches at byte 0, at EOF, and as the whole file", function()
+    local head = write_file("h.txt", "OLD rest\n")
+    assert.is_false(run_tool(def, edit_args(head, "OLD", "NEW")).is_error)
+    assert.equal("NEW rest\n", read_back(head))
+    local tail = write_file("t.txt", "rest OLD")
+    assert.is_false(run_tool(def, edit_args(tail, "OLD", "NEW")).is_error)
+    assert.equal("rest NEW", read_back(tail))
+    local whole = write_file("w.txt", "OLD")
+    assert.is_false(run_tool(def, edit_args(whole, "OLD", "brand new body")).is_error)
+    assert.equal("brand new body", read_back(whole))
+  end)
+
+  it("grows and shrinks the file through the rewrite", function()
+    local grow = write_file("g.txt", "a[X]b")
+    assert.is_false(run_tool(def, edit_args(grow, "[X]", "[XXXXXXXX]")).is_error)
+    assert.equal("a[XXXXXXXX]b", read_back(grow))
+    local shrink = write_file("s.txt", "a[XXXXXXXX]b")
+    assert.is_false(run_tool(def, edit_args(shrink, "[XXXXXXXX]", "[X]")).is_error)
+    assert.equal("a[X]b", read_back(shrink))
+  end)
+
+  it("enforces the 4 MiB cap and leaves the file untouched", function()
+    local body = string.rep("a", 4 * 1024 * 1024 + 1)
+    local path = write_file("big.txt", body)
+    local r = run_tool(def, edit_args(path, "aaa", "b"))
+    assert.is_true(r.is_error)
+    assert.truthy(r.content:find("4 MiB", 1, true))
+    assert.equal(#body, #read_back(path))
+  end)
+
+  it("accepts a file of exactly 4 MiB", function()
+    local body = string.rep("a", 4 * 1024 * 1024 - 3) .. "XYZ"
+    local path = write_file("cap.txt", body)
+    local r = run_tool(def, edit_args(path, "XYZ", "END"))
+    assert.is_false(r.is_error)
+    assert.equal(string.rep("a", 4 * 1024 * 1024 - 3) .. "END", read_back(path))
+  end)
+
+  it("rewrites a symlink's target in place", function()
+    local target = write_file("target.txt", "follow MARK here\n")
+    local link = root .. "/link.txt"
+    assert(os.execute('ln -s "' .. target .. '" "' .. link .. '"'))
+    local r = run_tool(def, edit_args(link, "MARK", "X"))
+    assert.is_false(r.is_error)
+    assert.equal("follow X here\n", read_back(target))
+    local pipe = assert(io.popen('ls -l "' .. link .. '"'))
+    local line = pipe:read("*l") or ""
+    pipe:close()
+    assert.truthy(line:match("^l")) -- still a symlink, not replaced by a file
+  end)
+
+  it("errors on a missing file", function()
+    local r = run_tool(def, edit_args(root .. "/nope.txt", "a", "b"))
+    assert.is_true(r.is_error)
+    assert.truthy(r.content:find("cannot open", 1, true))
   end)
 end)

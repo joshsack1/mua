@@ -13,14 +13,32 @@
 #include "mua/api/private/helpers.h"
 #include "mua/json.h"
 #include "mua/memory.h"
+#include "mua/paths.h"
 
 enum {
   kToolReadReturnCap = 256 * 1024,    // window bytes handed back to the model
   kToolReadScanCap = 8 * 1024 * 1024, // bytes examined on disk per call
   kToolReadChunk = 64 * 1024,
-  kToolSchemaCap = 16 * 1024, // parse bound for the static builtin schemas
-  kToolEintrMax = 100,        // consecutive EINTR retries
+  kToolEditFileCap = 4 * 1024 * 1024, // whole-file rewrite bound
+  kToolEditCountCap = 100,            // occurrence counting stops here
+  kToolSchemaCap = 16 * 1024,         // parse bound for the static builtin schemas
+  kToolEintrMax = 100,                // consecutive EINTR retries
 };
+
+static char *vformat(const char *fmt, va_list ap)
+{
+  va_list ap2;
+  va_copy(ap2, ap);
+  int need = vsnprintf(NULL, 0, fmt, ap);
+  if (need < 0) {
+    need = 0; // a formatting failure degrades to an empty message, not UB
+  }
+  char *msg = xmalloc((size_t)need + 1);
+  msg[0] = '\0';
+  (void)vsnprintf(msg, (size_t)need + 1, fmt, ap2); // sized by the first pass
+  va_end(ap2);
+  return msg;
+}
 
 // Fire a printf-formatted failure result; the model sees this text verbatim.
 static void fail(ToolDoneCb done, void *ud, const char *fmt, ...) MUA_PRINTF_ATTR(3, 4);
@@ -29,18 +47,23 @@ static void fail(ToolDoneCb done, void *ud, const char *fmt, ...)
 {
   va_list ap;
   va_start(ap, fmt);
-  va_list ap2;
-  va_copy(ap2, ap);
-  int need = vsnprintf(NULL, 0, fmt, ap);
+  char *msg = vformat(fmt, ap);
   va_end(ap);
-  if (need < 0) {
-    need = 0; // a formatting failure degrades to an empty message, not UB
-  }
-  char *msg = xmalloc((size_t)need + 1);
-  msg[0] = '\0';
-  (void)vsnprintf(msg, (size_t)need + 1, fmt, ap2); // sized by the first pass
-  va_end(ap2);
   ToolResult result = {.content = msg, .is_error = true};
+  done(ud, &result);
+}
+
+// Fire a printf-formatted success result. Never route file content through
+// the format string; succeed() carries arbitrary bytes.
+static void okf(ToolDoneCb done, void *ud, const char *fmt, ...) MUA_PRINTF_ATTR(3, 4);
+
+static void okf(ToolDoneCb done, void *ud, const char *fmt, ...)
+{
+  va_list ap;
+  va_start(ap, fmt);
+  char *msg = vformat(fmt, ap);
+  va_end(ap);
+  ToolResult result = {.content = msg, .is_error = false};
   done(ud, &result);
 }
 
@@ -238,12 +261,267 @@ static ToolExec *read_execute(cJSON *args, ToolDoneCb done, void *ud)
   return NULL;
 }
 
+// Writes all `len` bytes; iterations are bounded by progress + the EINTR cap.
+static bool write_all(int fd, const char *data, size_t len, int *io_errno)
+{
+  size_t written = 0;
+  int eintr = 0;
+  while (written < len) {
+    ssize_t got = write(fd, data + written, len - written);
+    if (got < 0) {
+      if (errno == EINTR && ++eintr <= kToolEintrMax) {
+        continue;
+      }
+      *io_errno = errno;
+      return false;
+    }
+    if (got == 0) { // no progress and no error: refuse to spin
+      *io_errno = EIO;
+      return false;
+    }
+    eintr = 0;
+    written += (size_t)got;
+  }
+  return true;
+}
+
+static ToolExec *write_execute(cJSON *args, ToolDoneCb done, void *ud)
+{
+  const char *path = json_get_cstr(args, "path");
+  if (path == NULL || path[0] == '\0') {
+    fail(done, ud, "write: path is required");
+    return NULL;
+  }
+  const char *content = json_get_cstr(args, "content");
+  if (content == NULL) { // "" is a valid write; missing/non-string is not
+    fail(done, ud, "write: content is required");
+    return NULL;
+  }
+  const char *last_slash = strrchr(path, '/');
+  if (last_slash != NULL) { // no '/': plain filename, no parent to create
+    char *parent =
+      (last_slash == path) ? xstrdup("/") : xstrndup(path, (size_t)(last_slash - path));
+    Error err = ERROR_INIT;
+    bool dir_ok = paths_ensure_dir(parent, &err);
+    xfree(parent);
+    if (!dir_ok) {
+      fail(done, ud, "write: %s", err.msg != NULL ? err.msg : "cannot create parent directory");
+      api_clear_error(&err);
+      return NULL;
+    }
+  }
+  // 0666 & umask, like shell tools: these are user files, not private state.
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+  if (fd < 0) {
+    fail(done, ud, "write: cannot open %s: %s", path, strerror(errno));
+    return NULL;
+  }
+  size_t len = strlen(content);
+  int io_errno = 0;
+  if (!write_all(fd, content, len, &io_errno)) {
+    fail(done, ud, "write: write %s: %s", path, strerror(io_errno));
+    (void)close(fd); // already failing; nothing useful to add
+    return NULL;
+  }
+  if (close(fd) != 0) { // deferred I/O errors (quota, NFS) surface here
+    fail(done, ud, "write: close %s: %s", path, strerror(errno));
+    return NULL;
+  }
+  okf(done, ud, "write: wrote %zu bytes to %s", len, path);
+  return NULL;
+}
+
+// Overlapping occurrence count (advance by one byte per hit), capped, with
+// the first match position recorded. Explicit lengths throughout: the
+// haystack may contain NUL bytes.
+static int count_occurrences(const char *hay, size_t hay_len, const char *needle, size_t needle_len,
+                             size_t *first_pos)
+{
+  int count = 0;
+  if (needle_len == 0 || needle_len > hay_len) {
+    return 0;
+  }
+  const char *cursor = hay;
+  size_t left = hay_len;
+  while (left >= needle_len) { // bounded by hay_len
+    const char *hit = memchr(cursor, needle[0], left - needle_len + 1);
+    if (hit == NULL) {
+      return count;
+    }
+    left -= (size_t)(hit - cursor);
+    cursor = hit;
+    if (memcmp(cursor, needle, needle_len) == 0) {
+      if (count == 0) {
+        *first_pos = (size_t)(cursor - hay);
+      }
+      count++;
+      if (count >= kToolEditCountCap) {
+        return count;
+      }
+    }
+    cursor++;
+    left--;
+  }
+  return count;
+}
+
+// Opens the edit target and reads it whole. Returns the open fd (caller owns)
+// or -1 with the failure result already fired.
+static int edit_open_and_read(const char *path, char **data_out, size_t *len_out, ToolDoneCb done,
+                              void *ud)
+{
+  int fd = open(path, O_RDWR | O_CLOEXEC);
+  if (fd < 0) {
+    fail(done, ud, "edit: cannot open %s: %s", path, strerror(errno));
+    return -1;
+  }
+  struct stat st;
+  if (fstat(fd, &st) != 0) {
+    fail(done, ud, "edit: stat %s: %s", path, strerror(errno));
+    (void)close(fd);
+    return -1;
+  }
+  if (!S_ISREG(st.st_mode)) {
+    fail(done, ud, "edit: %s is not a regular file", path);
+    (void)close(fd);
+    return -1;
+  }
+  if (st.st_size > kToolEditFileCap) {
+    fail(done, ud, "edit: %s exceeds the 4 MiB edit cap", path);
+    (void)close(fd);
+    return -1;
+  }
+  size_t size = (size_t)st.st_size;
+  char *data = xmalloc(size > 0 ? size : 1);
+  size_t got_total = 0;
+  int eintr = 0;
+  while (got_total < size) { // bounded by the fstat size latch
+    ssize_t got = read(fd, data + got_total, size - got_total);
+    if (got < 0) {
+      if (errno == EINTR && ++eintr <= kToolEintrMax) {
+        continue;
+      }
+      fail(done, ud, "edit: read %s: %s", path, strerror(errno));
+      xfree(data);
+      (void)close(fd);
+      return -1;
+    }
+    if (got == 0) {
+      break; // shrank under us; edit what arrived
+    }
+    eintr = 0;
+    got_total += (size_t)got;
+  }
+  *data_out = data;
+  *len_out = got_total;
+  return fd;
+}
+
+// The point of no return: shrink and rewrite on the same fd, preserving
+// inode, hardlinks, owner, and symlink targets. Consumes fd; fires the
+// failure result itself.
+static bool edit_rewrite(int fd, const char *path, const char *data, size_t len, ToolDoneCb done,
+                         void *ud)
+{
+  if (ftruncate(fd, 0) != 0) {
+    fail(done, ud, "edit: truncate %s: %s", path, strerror(errno));
+    (void)close(fd);
+    return false;
+  }
+  if (lseek(fd, 0, SEEK_SET) == (off_t)-1) {
+    fail(done, ud, "edit: seek %s: %s", path, strerror(errno));
+    (void)close(fd);
+    return false;
+  }
+  int io_errno = 0;
+  if (!write_all(fd, data, len, &io_errno)) {
+    fail(done, ud, "edit: write %s: %s", path, strerror(io_errno));
+    (void)close(fd);
+    return false;
+  }
+  if (close(fd) != 0) {
+    fail(done, ud, "edit: close %s: %s", path, strerror(errno));
+    return false;
+  }
+  return true;
+}
+
+static ToolExec *edit_execute(cJSON *args, ToolDoneCb done, void *ud)
+{
+  const char *path = json_get_cstr(args, "path");
+  if (path == NULL || path[0] == '\0') {
+    fail(done, ud, "edit: path is required");
+    return NULL;
+  }
+  const char *old_str = json_get_cstr(args, "old_string");
+  const char *new_str = json_get_cstr(args, "new_string");
+  if (old_str == NULL || new_str == NULL) { // "" new_string is a deletion; missing is not
+    fail(done, ud, "edit: old_string and new_string are required");
+    return NULL;
+  }
+  if (old_str[0] == '\0') {
+    fail(done, ud, "edit: old_string is empty");
+    return NULL;
+  }
+  if (strcmp(old_str, new_str) == 0) {
+    fail(done, ud, "edit: old_string and new_string are identical");
+    return NULL;
+  }
+  char *file_data = NULL;
+  size_t file_len = 0;
+  int fd = edit_open_and_read(path, &file_data, &file_len, done, ud);
+  if (fd < 0) {
+    return NULL;
+  }
+  size_t old_len = strlen(old_str);
+  size_t new_len = strlen(new_str);
+  size_t first = 0;
+  int count = count_occurrences(file_data, file_len, old_str, old_len, &first);
+  if (count != 1) {
+    if (count == 0) {
+      fail(done, ud, "edit: old_string not found in %s", path);
+    } else {
+      fail(done, ud, "edit: old_string occurs %d%s times in %s (must be unique)", count,
+           count >= kToolEditCountCap ? "+" : "", path);
+    }
+    xfree(file_data);
+    (void)close(fd);
+    return NULL;
+  }
+  size_t result_len = file_len - old_len + new_len;
+  char *result_data = xmalloc(result_len > 0 ? result_len : 1);
+  memcpy(result_data, file_data, first);
+  memcpy(result_data + first, new_str, new_len);
+  memcpy(result_data + first + new_len, file_data + first + old_len, file_len - first - old_len);
+  xfree(file_data);
+  bool ok = edit_rewrite(fd, path, result_data, result_len, done, ud);
+  xfree(result_data);
+  if (ok) {
+    okf(done, ud, "edit: replaced 1 occurrence in %s", path);
+  }
+  return NULL;
+}
+
 static const char READ_SCHEMA[] = //
   "{\"type\":\"object\",\"properties\":{"
   "\"path\":{\"type\":\"string\",\"description\":\"File path to read\"},"
   "\"offset\":{\"type\":\"integer\",\"description\":\"1-based line to start from (default 1)\"},"
   "\"limit\":{\"type\":\"integer\",\"description\":\"Maximum number of lines to return\"}},"
   "\"required\":[\"path\"]}";
+
+static const char WRITE_SCHEMA[] = //
+  "{\"type\":\"object\",\"properties\":{"
+  "\"path\":{\"type\":\"string\",\"description\":\"File path to write\"},"
+  "\"content\":{\"type\":\"string\",\"description\":\"Full file contents to write\"}},"
+  "\"required\":[\"path\",\"content\"]}";
+
+static const char EDIT_SCHEMA[] = //
+  "{\"type\":\"object\",\"properties\":{"
+  "\"path\":{\"type\":\"string\",\"description\":\"File path to edit\"},"
+  "\"old_string\":{\"type\":\"string\","
+  "\"description\":\"Exact text to replace; must occur exactly once\"},"
+  "\"new_string\":{\"type\":\"string\",\"description\":\"Replacement text\"}},"
+  "\"required\":[\"path\",\"old_string\",\"new_string\"]}";
 
 static const ToolDef tool_defs[] = {
   {
@@ -253,6 +531,23 @@ static const ToolDef tool_defs[] = {
     .params_schema = READ_SCHEMA,
     .mutating = false,
     .execute = read_execute,
+  },
+  {
+    .name = "write",
+    .description = "Write content to a file, creating it and any missing parent "
+                   "directories; replaces any existing contents entirely.",
+    .params_schema = WRITE_SCHEMA,
+    .mutating = true,
+    .execute = write_execute,
+  },
+  {
+    .name = "edit",
+    .description = "Replace one exact occurrence of old_string with new_string in a "
+                   "file. Fails unless old_string occurs exactly once; include enough "
+                   "surrounding context to make it unique.",
+    .params_schema = EDIT_SCHEMA,
+    .mutating = true,
+    .execute = edit_execute,
   },
 };
 
