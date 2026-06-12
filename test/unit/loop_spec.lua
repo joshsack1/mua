@@ -19,4 +19,10 @@ describe("loop singleton", function()
     assert.is_true(lib.loop_init())
     assert.is_true(lib.loop_close())
   end)
+
+  it("loop_run_nowait returns immediately when idle", function()
+    assert.is_true(lib.loop_init())
+    assert.equal(0, lib.loop_run_nowait()) -- the REPL's stale-SIGINT flush
+    assert.is_true(lib.loop_close())
+  end)
 end)

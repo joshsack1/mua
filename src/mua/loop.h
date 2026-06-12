@@ -10,6 +10,7 @@
 bool loop_init(void);
 uv_loop_t *loop_get(void); // valid between loop_init and loop_close
 int loop_run(void);        // uv_run(UV_RUN_DEFAULT)
+int loop_run_nowait(void); // one non-blocking pass; flushes stale SIGINTs between turns
 void loop_stop(void);
 bool loop_close(void); // false (and a log line) if handles leaked
 

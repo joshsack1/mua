@@ -68,6 +68,11 @@ int loop_run(void)
   return uv_run(&g_loop.loop, UV_RUN_DEFAULT);
 }
 
+int loop_run_nowait(void)
+{
+  return uv_run(&g_loop.loop, UV_RUN_NOWAIT);
+}
+
 void loop_stop(void)
 {
   uv_stop(&g_loop.loop);

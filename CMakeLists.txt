@@ -37,6 +37,7 @@ set_target_properties(cjson PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # both the executable and a shared library for FFI unit tests (default symbol
 # visibility keeps internals reachable from test/unit).
 set(MUA_SOURCES
+    src/mua/agent.c
     src/mua/api/private/helpers.c
     src/mua/http.c
     src/mua/json.c

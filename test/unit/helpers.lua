@@ -31,6 +31,7 @@ ffi.cdef([[
   bool loop_init(void);
   uv_loop_t *loop_get(void);
   int loop_run(void);
+  int loop_run_nowait(void);
   void loop_stop(void);
   bool loop_close(void);
 ]])
