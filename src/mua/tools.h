@@ -22,7 +22,9 @@ typedef struct {
 // callee, which must xfree it (typically after copying into a tool message).
 typedef void (*ToolDoneCb)(void *ud, const ToolResult *result);
 
-typedef struct ToolExec ToolExec; // opaque; first defined by bash (async)
+// Opaque async-execution handle (bash). Valid from a non-NULL execute return
+// until the moment `done` fires — callers null their reference inside done.
+typedef struct ToolExec ToolExec;
 
 // One uniform contract: `args` is the parsed arguments object, BORROWED for
 // the duration of this call only (async tools copy what they outlive it
@@ -44,6 +46,9 @@ const ToolDef *tools_lookup(const char *name); // NULL-safe; NULL on unknown
 // per call; caller owns. NULL + err only on a broken builtin schema.
 cJSON *tools_build_openai_array(Error *err);
 
-void tools_cancel(ToolExec *exec); // NULL-safe; no-op until an async tool exists
+// Kills a running async tool (SIGKILL). NULL-safe. `done` still fires exactly
+// once afterwards, carrying a canceled result — cancellation never suppresses
+// the done contract.
+void tools_cancel(ToolExec *exec);
 
 #endif // MUA_TOOLS_H

@@ -111,8 +111,8 @@ describe("tools registry", function()
     assert.is_false(def.mutating)
   end)
 
-  it("write and edit are registered as mutating", function()
-    for _, name in ipairs({ "write", "edit" }) do
+  it("write, edit, and bash are registered as mutating", function()
+    for _, name in ipairs({ "write", "edit", "bash" }) do
       local def = lib.tools_lookup(name)
       assert.is_true(def ~= nil)
       assert.equal(name, ffi.string(def.name))
@@ -132,10 +132,11 @@ describe("tools registry", function()
     assert.equal(ffi.C.kErrorTypeNone, err.type)
     local s = printed(arr)
     lib.json_free(arr)
-    assert.equal(3, select(2, s:gsub('"type":"function"', "")))
+    assert.equal(4, select(2, s:gsub('"type":"function"', "")))
     assert.truthy(s:find('"name":"read"', 1, true))
     assert.truthy(s:find('"name":"write"', 1, true))
     assert.truthy(s:find('"name":"edit"', 1, true))
+    assert.truthy(s:find('"name":"bash"', 1, true))
     assert.truthy(s:find('"required":["path"]', 1, true))
     assert.truthy(s:find('"required":["path","old_string","new_string"]', 1, true))
     lib.json_free(parse(s)) -- round-trip: the printed array re-parses
@@ -415,5 +416,137 @@ describe("edit tool", function()
     local r = run_tool(def, edit_args(root .. "/nope.txt", "a", "b"))
     assert.is_true(r.is_error)
     assert.truthy(r.content:find("cannot open", 1, true))
+  end)
+end)
+
+describe("bash tool", function()
+  local def = lib.tools_lookup("bash")
+
+  setup(function()
+    assert.is_true(lib.loop_init())
+  end)
+
+  teardown(function()
+    assert.is_true(lib.loop_close()) -- fails loudly if bash leaked a handle
+  end)
+
+  --- Run bash to completion on the singleton loop. Returns the captured
+  --- result and whether execute went async (returned a handle).
+  local function run_bash(args_json)
+    local args = parse(args_json)
+    local captured
+    local calls = 0
+    local cb = ffi.cast("ToolDoneCb", function(_, result)
+      calls = calls + 1
+      captured = {
+        content = result.content ~= nil and ffi.string(result.content) or nil,
+        is_error = result.is_error,
+      }
+      lib.xfree(result.content)
+    end)
+    local exec = def.execute(args, cb, nil)
+    lib.json_free(args) -- borrowed only for the call; uv_spawn copied argv
+    local async = exec ~= nil
+    if async then
+      assert.equal(0, lib.loop_run()) -- drains all three handles
+    end
+    assert.equal(1, calls) -- done fired exactly once, sync or async
+    cb:free()
+    return captured, async
+  end
+
+  it("captures output from a clean exit", function()
+    local r, async = run_bash('{"command":"echo hi"}')
+    assert.is_true(async)
+    assert.is_false(r.is_error)
+    assert.equal("hi\n", r.content)
+  end)
+
+  it("annotates a nonzero exit code", function()
+    local r = run_bash('{"command":"echo out; exit 3"}')
+    assert.is_true(r.is_error)
+    assert.equal("out\n\n[bash: exit code 3]", r.content)
+  end)
+
+  it("interleaves stdout and stderr in order", function()
+    local r = run_bash('{"command":"echo one; echo two >&2; echo three"}')
+    assert.is_false(r.is_error)
+    assert.equal("one\ntwo\nthree\n", r.content)
+  end)
+
+  it("kills a command at the timeout", function()
+    local r = run_bash('{"command":"sleep 5","timeout_ms":100}')
+    assert.is_true(r.is_error)
+    assert.equal("[bash: timed out after 100 ms (SIGKILL)]", r.content)
+  end)
+
+  it("truncates at 64 KiB and drains to EOF", function()
+    -- 3000 x 41-byte lines = ~123 KiB; a deadlocked drain would instead ride
+    -- the default 30 s timeout and fail the suite on wall clock.
+    local line = "0123456789012345678901234567890123456789"
+    local r = run_bash('{"command":"yes ' .. line .. ' | head -n 3000"}')
+    assert.is_false(r.is_error) -- head exits 0; truncation is not failure
+    local note = "\n[bash: output truncated at 64 KiB]"
+    assert.equal(64 * 1024 + #note, #r.content)
+    assert.equal(line .. "\n", r.content:sub(1, 41))
+    assert.truthy(r.content:find(note, 1, true))
+  end)
+
+  it("reports death by signal", function()
+    local r = run_bash('{"command":"kill -TERM $$"}')
+    assert.is_true(r.is_error)
+    assert.equal("[bash: killed by signal 15]", r.content)
+  end)
+
+  it("gives up on orphaned pipe holders after the grace window", function()
+    local r = run_bash('{"command":"echo hi; sleep 2 &"}')
+    assert.is_false(r.is_error) -- the shell itself exited 0
+    assert.equal(
+      "hi\n\n[bash: stopped reading 500 ms after exit; "
+        .. "a background process still holds the output pipe]",
+      r.content
+    )
+  end)
+
+  it("wires stdin to /dev/null", function()
+    local r = run_bash('{"command":"read x && echo got || echo eof"}')
+    assert.equal("eof\n", r.content)
+  end)
+
+  it("returns empty content for silent success", function()
+    local r = run_bash('{"command":"true"}')
+    assert.is_false(r.is_error)
+    assert.equal("", r.content)
+  end)
+
+  it("validates command and timeout_ms inline", function()
+    local no_command, async = run_bash("{}")
+    assert.is_false(async) -- validation fails before any handle exists
+    assert.is_true(no_command.is_error)
+    assert.truthy(no_command.content:find("command is required", 1, true))
+    local bad_timeout, async2 = run_bash('{"command":"true","timeout_ms":"x"}')
+    assert.is_false(async2)
+    assert.is_true(bad_timeout.is_error)
+    assert.truthy(bad_timeout.content:find("timeout_ms", 1, true))
+  end)
+
+  it("cancel kills the command and still fires done", function()
+    local args = parse('{"command":"sleep 5"}')
+    local captured
+    local calls = 0
+    local cb = ffi.cast("ToolDoneCb", function(_, result)
+      calls = calls + 1
+      captured = { content = ffi.string(result.content), is_error = result.is_error }
+      lib.xfree(result.content)
+    end)
+    local exec = def.execute(args, cb, nil)
+    lib.json_free(args)
+    assert.is_true(exec ~= nil)
+    lib.tools_cancel(exec)
+    assert.equal(0, lib.loop_run())
+    assert.equal(1, calls)
+    cb:free()
+    assert.is_true(captured.is_error)
+    assert.equal("[bash: canceled]", captured.content)
   end)
 end)

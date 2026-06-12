@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -10,8 +11,12 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <uv.h>
+
 #include "mua/api/private/helpers.h"
 #include "mua/json.h"
+#include "mua/log.h"
+#include "mua/loop.h"
 #include "mua/memory.h"
 #include "mua/paths.h"
 
@@ -21,8 +26,13 @@ enum {
   kToolReadChunk = 64 * 1024,
   kToolEditFileCap = 4 * 1024 * 1024, // whole-file rewrite bound
   kToolEditCountCap = 100,            // occurrence counting stops here
-  kToolSchemaCap = 16 * 1024,         // parse bound for the static builtin schemas
-  kToolEintrMax = 100,                // consecutive EINTR retries
+  kToolBashOutputCap = 64 * 1024,     // merged stdout+stderr kept for the model
+  kToolBashScratch = 8 * 1024,        // read_cb scratch buffer
+  kToolBashDefaultTimeoutMs = 30000,
+  kToolBashMaxTimeoutMs = 120000, // hard ceiling regardless of the model's value
+  kToolBashGraceMs = 500,         // post-exit wait for orphaned pipe holders
+  kToolSchemaCap = 16 * 1024,     // parse bound for the static builtin schemas
+  kToolEintrMax = 100,            // consecutive EINTR retries
 };
 
 static char *vformat(const char *fmt, va_list ap)
@@ -502,6 +512,377 @@ static ToolExec *edit_execute(cJSON *args, ToolDoneCb done, void *ud)
   return NULL;
 }
 
+// bash: the one async tool. Three loop handles (process, merged-output pipe,
+// one timer serving the timeout and then the post-exit grace); `done` fires
+// in the last of the three close callbacks, and the struct dies right after.
+struct ToolExec {
+  uv_process_t proc;
+  uv_pipe_t out;    // read end of the single merged stdout+stderr pipe
+  uv_timer_t timer; // timeout role, then re-armed as the post-exit grace
+  ToolDoneCb done;
+  void *ud;
+  Buf output;     // capped at kToolBashOutputCap
+  size_t dropped; // bytes drained past the cap (never stop reading)
+  size_t nuls;    // NUL bytes stripped (they would truncate the C-string result)
+  int64_t timeout_ms;
+  int64_t exit_status;
+  int term_signal;
+  bool exited, pipe_done, timed_out, canceled, done_fired;
+  bool timer_closing, grace_armed, grace_forced;
+  int closes_done;
+  int closes_expected; // 3 on a successful spawn; fewer on setup unwinds
+  char scratch[kToolBashScratch];
+};
+
+// Output annotations: at most one outcome note + truncation + grace + NULs.
+static char *bash_content(ToolExec *exec)
+{
+  char notes[4][96];
+  size_t note_count = 0;
+  if (exec->timed_out) {
+    (void)snprintf(notes[note_count], sizeof notes[0], "[bash: timed out after %lld ms (SIGKILL)]",
+                   (long long)exec->timeout_ms);
+    note_count++;
+  } else if (exec->canceled) {
+    (void)snprintf(notes[note_count], sizeof notes[0], "[bash: canceled]");
+    note_count++;
+  } else if (exec->term_signal != 0) {
+    (void)snprintf(notes[note_count], sizeof notes[0], "[bash: killed by signal %d]",
+                   exec->term_signal);
+    note_count++;
+  } else if (exec->exit_status != 0) {
+    (void)snprintf(notes[note_count], sizeof notes[0], "[bash: exit code %lld]",
+                   (long long)exec->exit_status);
+    note_count++;
+  }
+  if (exec->dropped > 0) {
+    (void)snprintf(notes[note_count], sizeof notes[0], "[bash: output truncated at 64 KiB]");
+    note_count++;
+  }
+  if (exec->grace_forced) {
+    (void)snprintf(notes[note_count], sizeof notes[0],
+                   "[bash: stopped reading 500 ms after exit; "
+                   "a background process still holds the output pipe]");
+    note_count++;
+  }
+  if (exec->nuls > 0) {
+    (void)snprintf(notes[note_count], sizeof notes[0], "[bash: %zu NUL bytes removed]", exec->nuls);
+    note_count++;
+  }
+  size_t total = exec->output.size;
+  for (size_t i = 0; i < note_count; i++) {
+    total += strlen(notes[i]) + 1; // newline joiner (first piece may skip it)
+  }
+  char *content = xmalloc(total + 1);
+  size_t pos = 0;
+  if (exec->output.size > 0) {
+    memcpy(content, exec->output.data, exec->output.size);
+    pos = exec->output.size;
+  }
+  for (size_t i = 0; i < note_count; i++) {
+    if (pos > 0) {
+      content[pos] = '\n';
+      pos++;
+    }
+    size_t len = strlen(notes[i]);
+    memcpy(content + pos, notes[i], len);
+    pos += len;
+  }
+  content[pos] = '\0';
+  return content;
+}
+
+static void bash_close_cb(uv_handle_t *handle)
+{
+  ToolExec *exec = handle->data;
+  exec->closes_done++;
+  if (exec->closes_done < exec->closes_expected) {
+    return;
+  }
+  if (!exec->done_fired) { // setup-failure paths fired their result inline
+    exec->done_fired = true;
+    bool is_error =
+      exec->timed_out || exec->canceled || exec->term_signal != 0 || exec->exit_status != 0;
+    ToolResult result = {.content = bash_content(exec), .is_error = is_error};
+    exec->done(exec->ud, &result);
+  }
+  buf_free(&exec->output);
+  xfree(exec);
+}
+
+static void bash_grace_cb(uv_timer_t *timer);
+
+// Joins exit and pipe EOF: both done -> close the timer (the third handle);
+// exited with the pipe still open -> re-arm the timer as the grace wait.
+static void bash_maybe_finish(ToolExec *exec)
+{
+  if (!exec->exited) {
+    return;
+  }
+  if (exec->pipe_done) {
+    if (!exec->timer_closing) {
+      exec->timer_closing = true;
+      (void)uv_timer_stop(&exec->timer); // cannot fail on an initialized timer
+      uv_close((uv_handle_t *)&exec->timer, bash_close_cb);
+    }
+    return;
+  }
+  if (!exec->grace_armed) {
+    exec->grace_armed = true;
+    (void)uv_timer_stop(&exec->timer);
+    if (uv_timer_start(&exec->timer, bash_grace_cb, kToolBashGraceMs, 0) != 0) {
+      // Cannot wait: take the grace exit now, closing both remaining handles
+      // directly rather than re-entering this function.
+      exec->grace_forced = true;
+      exec->pipe_done = true;
+      uv_close((uv_handle_t *)&exec->out, bash_close_cb);
+      exec->timer_closing = true;
+      uv_close((uv_handle_t *)&exec->timer, bash_close_cb);
+    }
+  }
+}
+
+static void bash_force_pipe_close(ToolExec *exec)
+{
+  if (exec->pipe_done) {
+    return;
+  }
+  exec->pipe_done = true;
+  uv_close((uv_handle_t *)&exec->out, bash_close_cb);
+  bash_maybe_finish(exec);
+}
+
+static void bash_grace_cb(uv_timer_t *timer)
+{
+  ToolExec *exec = timer->data;
+  exec->grace_forced = true;
+  bash_force_pipe_close(exec);
+}
+
+static void bash_alloc_cb(uv_handle_t *handle, size_t suggested, uv_buf_t *buf)
+{
+  (void)suggested;
+  ToolExec *exec = handle->data;
+  buf->base = exec->scratch; // serial reads: one reusable scratch is legal
+  buf->len = sizeof exec->scratch;
+}
+
+// Appends to the capped output, stripping NULs and counting overflow. The
+// pipe is always drained to EOF: stopping reads would deadlock the child on
+// kernel-buffer backpressure.
+static void bash_append_output(ToolExec *exec, const char *bytes, size_t len)
+{
+  size_t pos = 0;
+  while (pos < len) { // bounded by len
+    const char *nul = memchr(bytes + pos, '\0', len - pos);
+    size_t seg = (nul != NULL) ? (size_t)(nul - (bytes + pos)) : len - pos;
+    if (seg > 0) {
+      size_t room = exec->output.size < exec->output.max ? exec->output.max - exec->output.size : 0;
+      size_t take = seg < room ? seg : room;
+      if (take > 0) {
+        (void)buf_append(&exec->output, bytes + pos, take); // exact fit cannot refuse
+      }
+      exec->dropped += seg - take;
+      pos += seg;
+    }
+    if (nul != NULL) {
+      exec->nuls++;
+      pos++; // skip the NUL itself
+    }
+  }
+}
+
+static void bash_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
+{
+  (void)buf; // always exec->scratch
+  ToolExec *exec = stream->data;
+  if (nread > 0) {
+    bash_append_output(exec, exec->scratch, (size_t)nread);
+    return;
+  }
+  if (nread < 0) { // UV_EOF or a read error: either way this pipe is finished
+    bash_force_pipe_close(exec);
+  }
+  // nread == 0: spurious wakeup; keep reading
+}
+
+static void bash_exit_cb(uv_process_t *proc, int64_t exit_status, int term_signal)
+{
+  ToolExec *exec = proc->data;
+  exec->exited = true;
+  exec->exit_status = exit_status;
+  exec->term_signal = term_signal;
+  uv_close((uv_handle_t *)&exec->proc, bash_close_cb);
+  bash_maybe_finish(exec);
+}
+
+static void bash_timeout_cb(uv_timer_t *timer)
+{
+  ToolExec *exec = timer->data;
+  if (exec->exited) {
+    return; // raced the exit; the join is already in motion
+  }
+  exec->timed_out = true;
+  int rc = uv_process_kill(&exec->proc, SIGKILL);
+  if (rc != 0 && rc != UV_ESRCH) { // ESRCH: it exited as we fired — success
+    log_msg(kLogWarn, "bash: kill on timeout: %s", uv_strerror(rc));
+  }
+}
+
+// Validates command and timeout. The timeout is clamped into
+// [1, kToolBashMaxTimeoutMs] regardless of the model's value.
+static bool bash_parse_args(cJSON *args, const char **command, int64_t *timeout_ms, ToolDoneCb done,
+                            void *ud)
+{
+  *command = json_get_cstr(args, "command");
+  if (*command == NULL || (*command)[0] == '\0') {
+    fail(done, ud, "bash: command is required");
+    return false;
+  }
+  *timeout_ms = kToolBashDefaultTimeoutMs;
+  const cJSON *item = cJSON_GetObjectItemCaseSensitive(args, "timeout_ms");
+  if (item != NULL) {
+    if (!cJSON_IsNumber(item)) {
+      fail(done, ud, "bash: timeout_ms must be a number");
+      return false;
+    }
+    *timeout_ms = (int64_t)cJSON_GetNumberValue(item);
+    if (*timeout_ms < 1) {
+      *timeout_ms = 1;
+    }
+    if (*timeout_ms > kToolBashMaxTimeoutMs) {
+      *timeout_ms = kToolBashMaxTimeoutMs;
+    }
+  }
+  return true;
+}
+
+// Arms reading and the timeout after a successful spawn. On failure the
+// child is killed and the close join finishes silently (done already fired).
+static bool bash_arm(ToolExec *exec)
+{
+  int rc = uv_read_start((uv_stream_t *)&exec->out, bash_alloc_cb, bash_read_cb);
+  if (rc != 0) {
+    exec->done_fired = true;
+    fail(exec->done, exec->ud, "bash: read start: %s", uv_strerror(rc));
+    (void)uv_process_kill(&exec->proc, SIGKILL); // ESRCH would mean already dead: fine
+    exec->pipe_done = true;
+    uv_close((uv_handle_t *)&exec->out, bash_close_cb);
+    return false;
+  }
+  rc = uv_timer_start(&exec->timer, bash_timeout_cb, (uint64_t)exec->timeout_ms, 0);
+  if (rc != 0) {
+    // The mandatory timeout cannot be armed: do not run unbounded.
+    exec->done_fired = true;
+    fail(exec->done, exec->ud, "bash: timer start: %s", uv_strerror(rc));
+    (void)uv_process_kill(&exec->proc, SIGKILL);
+    return false; // reads drain to EOF; exit_cb completes the join
+  }
+  return true;
+}
+
+// The merged-output pipe, CLOEXEC on both ends by hand (macOS has no pipe2);
+// the child's copies are dup2'd onto its fds 1/2 by uv_spawn, which clears
+// the flag there. The write end stays blocking; uv_pipe_open later makes
+// only our read end nonblocking. Fires the failure result itself.
+static bool bash_make_pipe(int fds[2], ToolDoneCb done, void *ud)
+{
+  if (pipe(fds) != 0) {
+    fail(done, ud, "bash: pipe: %s", strerror(errno));
+    return false;
+  }
+  if (fcntl(fds[0], F_SETFD, FD_CLOEXEC) != 0 || fcntl(fds[1], F_SETFD, FD_CLOEXEC) != 0) {
+    fail(done, ud, "bash: fcntl: %s", strerror(errno));
+    (void)close(fds[0]); // unwinding a failed setup
+    (void)close(fds[1]);
+    return false;
+  }
+  return true;
+}
+
+static ToolExec *bash_execute(cJSON *args, ToolDoneCb done, void *ud)
+{
+  const char *command = NULL;
+  int64_t timeout_ms = 0;
+  if (!bash_parse_args(args, &command, &timeout_ms, done, ud)) {
+    return NULL;
+  }
+  int fds[2];
+  if (!bash_make_pipe(fds, done, ud)) {
+    return NULL;
+  }
+  ToolExec *exec = xcalloc(1, sizeof *exec);
+  exec->done = done;
+  exec->ud = ud;
+  exec->timeout_ms = timeout_ms;
+  buf_init(&exec->output, kToolBashOutputCap);
+  exec->proc.data = exec;
+  exec->out.data = exec;
+  exec->timer.data = exec;
+  uv_loop_t *loop = loop_get();
+  if (uv_pipe_init(loop, &exec->out, 0) != 0) { // cannot fail on a live loop
+    fail(done, ud, "bash: pipe handle init failed");
+    (void)close(fds[0]);
+    (void)close(fds[1]);
+    buf_free(&exec->output);
+    xfree(exec);
+    return NULL;
+  }
+  exec->closes_expected = 1; // the pipe handle is registered from here on
+  if (uv_pipe_open(&exec->out, fds[0]) != 0) {
+    (void)close(fds[0]); // open refused it, so it is still ours
+    (void)close(fds[1]);
+    exec->done_fired = true;
+    fail(done, ud, "bash: pipe open failed");
+    uv_close((uv_handle_t *)&exec->out, bash_close_cb);
+    return NULL;
+  }
+  // fds[0] is owned by the pipe handle from here on: never close it by hand.
+  if (uv_timer_init(loop, &exec->timer) != 0) { // cannot fail on a live loop
+    (void)close(fds[1]);
+    exec->done_fired = true;
+    fail(done, ud, "bash: timer init failed");
+    uv_close((uv_handle_t *)&exec->out, bash_close_cb); // takes fds[0] with it
+    return NULL;
+  }
+  exec->closes_expected = 2;
+  uv_stdio_container_t stdio[3];
+  stdio[0].flags = UV_IGNORE; // /dev/null stdin on unix
+  stdio[1].flags = UV_INHERIT_FD;
+  stdio[1].data.fd = fds[1];
+  stdio[2].flags = UV_INHERIT_FD;
+  stdio[2].data.fd = fds[1]; // same fd on 1 and 2: true interleaving
+  // uv_spawn never modifies argv; the cast unconst's the borrowed command,
+  // and the fixed entries live in writable storage to satisfy -Wwrite-strings.
+  static char sh_path[] = "/bin/sh";
+  static char sh_flag[] = "-c";
+  char *argv[] = {sh_path, sh_flag, (char *)command, NULL};
+  uv_process_options_t options = {
+    .file = sh_path,
+    .args = argv,
+    .exit_cb = bash_exit_cb,
+    .stdio_count = 3,
+    .stdio = stdio,
+  };
+  int rc = uv_spawn(loop, &exec->proc, &options);
+  (void)close(fds[1]); // ours regardless: the child has its own copies, or never existed
+  if (rc != 0) {
+    exec->closes_expected = 3; // uv_spawn registers the handle even on failure
+    exec->done_fired = true;
+    fail(done, ud, "bash: spawn: %s", uv_strerror(rc));
+    uv_close((uv_handle_t *)&exec->proc, bash_close_cb);
+    uv_close((uv_handle_t *)&exec->out, bash_close_cb);
+    exec->timer_closing = true;
+    uv_close((uv_handle_t *)&exec->timer, bash_close_cb);
+    return NULL;
+  }
+  exec->closes_expected = 3;
+  if (!bash_arm(exec)) {
+    return NULL; // done fired inline; the join frees the struct silently
+  }
+  return exec;
+}
+
 static const char READ_SCHEMA[] = //
   "{\"type\":\"object\",\"properties\":{"
   "\"path\":{\"type\":\"string\",\"description\":\"File path to read\"},"
@@ -522,6 +903,13 @@ static const char EDIT_SCHEMA[] = //
   "\"description\":\"Exact text to replace; must occur exactly once\"},"
   "\"new_string\":{\"type\":\"string\",\"description\":\"Replacement text\"}},"
   "\"required\":[\"path\",\"old_string\",\"new_string\"]}";
+
+static const char BASH_SCHEMA[] = //
+  "{\"type\":\"object\",\"properties\":{"
+  "\"command\":{\"type\":\"string\",\"description\":\"Shell command run via /bin/sh -c\"},"
+  "\"timeout_ms\":{\"type\":\"integer\",\"description\":"
+  "\"Kill the command after this many milliseconds (default 30000, max 120000)\"}},"
+  "\"required\":[\"command\"]}";
 
 static const ToolDef tool_defs[] = {
   {
@@ -548,6 +936,15 @@ static const ToolDef tool_defs[] = {
     .params_schema = EDIT_SCHEMA,
     .mutating = true,
     .execute = edit_execute,
+  },
+  {
+    .name = "bash",
+    .description = "Run a shell command with stdout and stderr merged into one stream. "
+                   "Output is capped at 64 KiB; the command is killed after timeout_ms "
+                   "(default 30 s, max 120 s). stdin is /dev/null.",
+    .params_schema = BASH_SCHEMA,
+    .mutating = true,
+    .execute = bash_execute,
   },
 };
 
@@ -592,5 +989,16 @@ cJSON *tools_build_openai_array(Error *err)
 
 void tools_cancel(ToolExec *exec)
 {
-  (void)exec; // no async tool exists yet; bash supplies the first ToolExec
+  if (exec == NULL) {
+    return;
+  }
+  exec->canceled = true;
+  if (!exec->exited) {
+    int rc = uv_process_kill(&exec->proc, SIGKILL);
+    if (rc != 0 && rc != UV_ESRCH) { // ESRCH: exited under us — already done
+      log_msg(kLogWarn, "bash: kill on cancel: %s", uv_strerror(rc));
+    }
+    return; // exit_cb drives the join; done still fires exactly once
+  }
+  bash_force_pipe_close(exec); // exited, but a holder kept the pipe open
 }
