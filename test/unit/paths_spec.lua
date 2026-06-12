@@ -8,6 +8,7 @@ t.cdef([[
   char *paths_state_dir(void);
   char *paths_runtime_dir(void);
   char *paths_join(const char *a, const char *b);
+  bool paths_ensure_dir(const char *path, Error *err);
   int setenv(const char *name, const char *value, int overwrite);
   int unsetenv(const char *name);
 ]])
@@ -75,5 +76,64 @@ describe("paths", function()
     assert.equal("/a/b", take(lib.paths_join("/a/", "b")))
     assert.equal("/a/b/c", take(lib.paths_join("/a", "b/c")))
     assert.equal("/x", take(lib.paths_join("/", "x")))
+  end)
+end)
+
+describe("paths_ensure_dir", function()
+  local root
+  local err
+
+  -- "drwx------" from `ls -ld`: directory-ness and mode 0700 in one portable
+  -- check (macOS appends @/+ after the 10-char mode field; prefix unaffected).
+  local function is_dir_0700(path)
+    local pipe = assert(io.popen('ls -ld "' .. path .. '" 2>/dev/null'))
+    local line = pipe:read("*l") or ""
+    pipe:close()
+    return line:match("^drwx%-%-%-%-%-%-") ~= nil
+  end
+
+  before_each(function()
+    root = os.tmpname()
+    os.remove(root) -- want the free name, not the file tmpname may create
+    err = ffi.new("Error")
+    err.type = ffi.C.kErrorTypeNone
+  end)
+
+  after_each(function()
+    lib.api_clear_error(err)
+    os.execute('rm -rf "' .. root .. '"')
+  end)
+
+  it("creates nested directories with mode 0700", function()
+    assert.is_true(lib.paths_ensure_dir(root .. "/a/b/c", err))
+    assert.equal(ffi.C.kErrorTypeNone, err.type)
+    assert.is_true(is_dir_0700(root .. "/a/b/c"))
+    assert.is_true(is_dir_0700(root .. "/a"))
+  end)
+
+  it("is idempotent", function()
+    assert.is_true(lib.paths_ensure_dir(root .. "/a/b", err))
+    assert.is_true(lib.paths_ensure_dir(root .. "/a/b", err))
+    assert.equal(ffi.C.kErrorTypeNone, err.type)
+  end)
+
+  it("errors when a file is in the way at the leaf", function()
+    assert.is_true(lib.paths_ensure_dir(root, err))
+    assert(io.open(root .. "/f", "w")):close()
+    assert.is_false(lib.paths_ensure_dir(root .. "/f", err))
+    assert.equal(ffi.C.kErrorTypeValidation, err.type)
+    assert.is_true(err.msg ~= nil)
+  end)
+
+  it("errors when a file is in the way mid-path", function()
+    assert.is_true(lib.paths_ensure_dir(root, err))
+    assert(io.open(root .. "/f", "w")):close()
+    assert.is_false(lib.paths_ensure_dir(root .. "/f/sub", err))
+    assert.equal(ffi.C.kErrorTypeValidation, err.type)
+  end)
+
+  it("rejects an empty path", function()
+    assert.is_false(lib.paths_ensure_dir("", err))
+    assert.equal(ffi.C.kErrorTypeValidation, err.type)
   end)
 end)

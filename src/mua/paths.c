@@ -1,9 +1,13 @@
 #include "mua/paths.h"
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
+#include "mua/api/private/helpers.h"
 #include "mua/memory.h"
 
 static const char *nonempty_getenv(const char *name)
@@ -68,4 +72,60 @@ char *paths_join(const char *a, const char *b)
   memcpy(out + pos, b, len_b);
   out[pos + len_b] = '\0';
   return out;
+}
+
+// mkdir one prefix of the ensure-dir walk. EEXIST is tolerated without
+// inspection: a file in the way surfaces as ENOTDIR at the next component or
+// as the caller's final S_ISDIR check on the leaf.
+static bool mkdir_one(const char *prefix, Error *err)
+{
+  if (mkdir(prefix, 0700) == 0 || errno == EEXIST) {
+    return true;
+  }
+  if (errno == ENOTDIR) {
+    api_set_error(err, kErrorTypeValidation, "paths: a component of %s is not a directory", prefix);
+    return false;
+  }
+  api_set_error(err, kErrorTypeException, "paths: mkdir %s: %s", prefix, strerror(errno));
+  return false;
+}
+
+bool paths_ensure_dir(const char *path, Error *err)
+{
+  if (path == NULL || path[0] == '\0') {
+    api_set_error(err, kErrorTypeValidation, "paths: empty directory path");
+    return false;
+  }
+  char *buf = xstrdup(path);
+  size_t len = strlen(buf);
+  // Walk each '/'-terminated prefix; bounded by strlen. Starting at 1 skips
+  // the empty prefix of absolute paths.
+  for (size_t i = 1; i < len; i++) {
+    if (buf[i] != '/') {
+      continue;
+    }
+    buf[i] = '\0';
+    bool prefix_ok = mkdir_one(buf, err);
+    buf[i] = '/';
+    if (!prefix_ok) {
+      xfree(buf);
+      return false;
+    }
+  }
+  bool leaf_ok = mkdir_one(buf, err);
+  xfree(buf);
+  if (!leaf_ok) {
+    return false;
+  }
+  // stat (not lstat): a symlink to a directory is a valid state dir.
+  struct stat st;
+  if (stat(path, &st) != 0) {
+    api_set_error(err, kErrorTypeException, "paths: stat %s: %s", path, strerror(errno));
+    return false;
+  }
+  if (!S_ISDIR(st.st_mode)) {
+    api_set_error(err, kErrorTypeValidation, "paths: %s exists and is not a directory", path);
+    return false;
+  }
+  return true;
 }
