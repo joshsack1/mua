@@ -22,7 +22,7 @@ Housekeeping, slotted whenever: CI running the full gauntlet (`make && make test
 Turns mua from a streaming client into an agent. Too large for one context window — execute the commits below in order, one or a few per session, each green on the full gauntlet (`make && make test && make lint`, format-stable, no co-author trailers; run `make BUILD_DIR=build-san SANITIZE=1 test` after the tool/loop commits). **Full design: [docs/agent-milestone.md](docs/agent-milestone.md)** — read it before executing a commit; it carries the module surfaces, caps, wire-format reference, and per-commit test matrix. main.c is rewritten once, at commit 8 (commit 3 does a minimal migration so `-p` keeps working mid-milestone).
 
 - [x] 1. `feat(core): recursive ensure-dir in paths` — `paths_ensure_dir` (mkdir -p, 0700) + paths_spec
-- [ ] 2. `feat(session): append-only jsonl session store` — session.{c,h}, CMake entry, move shared cJSON cdefs into test/unit/helpers.lua, session_spec
+- [x] 2. `feat(session): append-only jsonl session store` — session.{c,h}, CMake entry, move shared cJSON cdefs into test/unit/helpers.lua, session_spec
 - [ ] 3. `feat(provider): tool calling with streamed tool_call accumulation` — openrouter v2 + seam changes + `start_attempt` full-reset fix + minimal main.c migration + openrouter_spec (verify once against a live tool call via `op run`)
 - [ ] 4. `feat(tools): registry, result contract, and the read tool` + tools_spec
 - [ ] 5. `feat(tools): write and edit with exact-match replacement`

@@ -46,6 +46,7 @@ set(MUA_SOURCES
     src/mua/memory.c
     src/mua/paths.c
     src/mua/provider/openrouter.c
+    src/mua/session.c
     src/mua/sse.c)
 
 add_library(mua_obj OBJECT ${MUA_SOURCES})

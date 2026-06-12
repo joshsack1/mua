@@ -2,12 +2,9 @@ local t = require("test.unit.helpers")
 local ffi = t.ffi
 local lib = t.lib
 
--- Declarations mirror src/mua/json.h (cJSON stays opaque on this side;
--- shared types come from helpers).
+-- Declarations mirror src/mua/json.h (cJSON stays opaque on this side; the
+-- typedef and parse/print/free/init come from helpers).
 t.cdef([[
-  typedef struct cJSON cJSON;
-  void json_init(void);
-  cJSON *json_parse(String doc, size_t max_size, Error *err);
   const char *json_get_cstr(const cJSON *obj, const char *key);
   bool json_get_int(const cJSON *obj, const char *key, int64_t *out);
   bool json_get_bool(const cJSON *obj, const char *key, bool *out);
@@ -19,8 +16,6 @@ t.cdef([[
   void json_add_int(cJSON *obj, const char *key, int64_t val);
   void json_add_bool(cJSON *obj, const char *key, bool val);
   cJSON *json_add_arr(cJSON *obj, const char *key);
-  String json_print(const cJSON *node);
-  void json_free(cJSON *node);
 
   cJSON *cJSON_GetArrayItem(const cJSON *array, int index);
   int cJSON_GetArraySize(const cJSON *array);
