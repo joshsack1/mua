@@ -24,7 +24,7 @@ Turns mua from a streaming client into an agent. Too large for one context windo
 - [x] 1. `feat(core): recursive ensure-dir in paths` — `paths_ensure_dir` (mkdir -p, 0700) + paths_spec
 - [x] 2. `feat(session): append-only jsonl session store` — session.{c,h}, CMake entry, move shared cJSON cdefs into test/unit/helpers.lua, session_spec
 - [x] 3. `feat(provider): tool calling with streamed tool_call accumulation` — openrouter v2 + seam changes + `start_attempt` full-reset fix + reject empty `messages` (`->child == NULL`) before `cJSON_CreateArrayReference`, which would silently build `"messages":[]` + minimal main.c migration + openrouter_spec (verify once against a live tool call via `op run`)
-- [ ] 4. `feat(tools): registry, result contract, and the read tool` + tools_spec
+- [x] 4. `feat(tools): registry, result contract, and the read tool` + tools_spec
 - [ ] 5. `feat(tools): write and edit with exact-match replacement`
 - [ ] 6. `feat(tools): bash via uv_spawn with mandatory timeout and bounded capture`
 - [ ] 7. `feat(agent): turn loop with step cap, tool gate, and cancellation` — agent.{c,h} + `loop_run_nowait`; a mid-turn `session_append` failure finishes `kTurnFailed` and appends nothing further (the poison latch enforces this; the `--resume` repair heals the dangling file state)
