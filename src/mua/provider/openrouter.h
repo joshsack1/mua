@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include <cjson/cJSON.h>
+
 #include "mua/api/private/defs.h"
 #include "mua/http.h"
 
@@ -14,13 +16,20 @@
 #define MUA_DEFAULT_MODEL "anthropic/claude-sonnet-4.6"
 #define MUA_OPENROUTER_BASE_URL "https://openrouter.ai/api/v1"
 #define MUA_HTTP_MAX_ATTEMPTS 5
+#define MUA_MAX_TOOL_CALLS 16 // streamed tool_call slots per response
 
 typedef struct OpenrouterStream OpenrouterStream;
 
 typedef struct {
   const char *model;  // NULL selects MUA_DEFAULT_MODEL
   int64_t max_tokens; // <= 0: omitted from the request (per-model defaults)
-  String prompt;
+  // The conversation, exact wire shape. REQUIRED non-empty array. Borrowed
+  // only for the openrouter_stream call: the body is printed synchronously
+  // and retries resend the printed bytes.
+  const cJSON *messages;
+  // Optional OpenAI-shaped tools array; NULL or empty omits the "tools" key.
+  // Borrowed like `messages`.
+  const cJSON *tools;
   const char *api_key;  // required; never logged, never quoted in Error messages
   const char *base_url; // NULL: $OPENROUTER_BASE_URL, then MUA_OPENROUTER_BASE_URL
 } OpenrouterOpts;
@@ -29,7 +38,10 @@ typedef struct {
 // invalid once that terminal callback returns.
 typedef struct {
   void (*on_text)(void *ud, const String *text);
-  void (*on_done)(void *ud, const String *finish_reason, int64_t completion_tokens);
+  // `message` is the COMPLETE wire-shaped assistant message ("role",
+  // "content" string or null, optional "tool_calls"); OWNERSHIP TRANSFERS to
+  // the callee, which must json_free it (or hand it on, e.g. to a session).
+  void (*on_done)(void *ud, cJSON *message, const String *finish_reason, int64_t completion_tokens);
   void (*on_error)(void *ud, const Error *err);
 } OpenrouterCallbacks;
 

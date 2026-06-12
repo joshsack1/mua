@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <cjson/cJSON.h>
+
 #include "auto/versiondef.h"
 #include "mua/api/private/helpers.h"
 #include "mua/http.h"
@@ -83,9 +85,11 @@ static void prompt_on_text(void *ud, const String *text)
   run->last_was_newline = (text->data[text->size - 1] == '\n');
 }
 
-static void prompt_on_done(void *ud, const String *finish_reason, int64_t completion_tokens)
+static void prompt_on_done(void *ud, cJSON *message, const String *finish_reason,
+                           int64_t completion_tokens)
 {
   PromptRun *run = ud;
+  json_free(message); // ownership transferred by on_done; the agent loop will keep it
   log_msg(kLogInfo, "stream done: finish_reason=%.*s completion_tokens=%lld",
           (int)finish_reason->size, finish_reason->data != NULL ? finish_reason->data : "",
           (long long)completion_tokens);
@@ -135,13 +139,19 @@ static int run_prompt(const char *prompt)
     return kExitFailure;
   }
   PromptRun run = {.exit_code = kExitFailure};
-  OpenrouterOpts opts = {.prompt = cstr_as_string(prompt), .api_key = api_key};
+  cJSON *messages = cJSON_CreateArray();
+  cJSON *message = cJSON_CreateObject();
+  json_add_cstr(message, "role", "user");
+  json_add_cstr(message, "content", prompt);
+  cJSON_AddItemToArray(messages, message);
+  OpenrouterOpts opts = {.messages = messages, .api_key = api_key};
   OpenrouterCallbacks cbs = {
     .on_text = prompt_on_text,
     .on_done = prompt_on_done,
     .on_error = prompt_on_error,
   };
   run.stream = openrouter_stream(http, &opts, &cbs, &run, &err);
+  json_free(messages); // borrowed only for the call: the body is already printed
   if (run.stream == NULL) {
     (void)fprintf(stderr, "mua: %s\n", err.msg != NULL ? err.msg : "request failed");
     api_clear_error(&err);

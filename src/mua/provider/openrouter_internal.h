@@ -12,8 +12,13 @@
 bool openrouter_handle_event(OpenrouterStream *stream, String data);
 
 // A bare stream carrying only callbacks and dispatch state — no HTTP request,
-// no retry timer. Free with openrouter_stream_free_for_test only.
+// no retry timer. Initializes the content/tool_call accumulator Bufs (a
+// zeroed Buf has max == 0 and refuses every append). Free with
+// openrouter_stream_free_for_test only.
 OpenrouterStream *openrouter_stream_new_for_test(const OpenrouterCallbacks *cb, void *ud);
 void openrouter_stream_free_for_test(OpenrouterStream *stream);
+
+// Whether any content or tool_call fragment was delivered (retry gate state).
+bool openrouter_stream_delivered_for_test(const OpenrouterStream *stream);
 
 #endif // MUA_PROVIDER_OPENROUTER_INTERNAL_H

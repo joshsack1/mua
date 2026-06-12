@@ -21,6 +21,11 @@ enum {
   kOrBackoffBaseMs = 500,
   kOrBackoffCapMs = 30000,
   kOrRetryAfterCapS = 60,
+  kOrToolIdCap = 64,           // bytes, including the NUL
+  kOrToolNameCap = 128,        // bytes, including the NUL
+  kOrToolArgsCap = 256 * 1024, // concatenated arguments fragments per call
+  kOrContentCap = 1024 * 1024, // full accumulated assistant text
+  kOrToolItemsPerEvent = 64,   // delta.tool_calls items in one event
 };
 
 typedef enum {
@@ -28,6 +33,15 @@ typedef enum {
   kOrModeSse,
   kOrModeErrorBody,
 } OrMode;
+
+// One streamed tool call, accumulated fragment by fragment: id/name latch
+// from the first fragment that carries them, arguments concatenate per index.
+typedef struct {
+  bool present; // some fragment named this index
+  char id[kOrToolIdCap];
+  char name[kOrToolNameCap];
+  Buf args; // the arguments JSON string, possibly split across fragments
+} OrToolCall;
 
 struct OpenrouterStream {
   HttpClient *http;
@@ -51,8 +65,27 @@ struct OpenrouterStream {
   bool cancel_requested;
   char finish_reason[kOrFinishReasonCap];
   int64_t completion_tokens;
+  Buf content; // full assistant text (on_text still streams deltas live)
+  OrToolCall tool_calls[MUA_MAX_TOOL_CALLS];
+  int tool_calls_hwm; // max present index + 1; assembly iterates [0, hwm)
   uint64_t prng_state;
 };
+
+static void accumulators_init(OpenrouterStream *stream)
+{
+  buf_init(&stream->content, kOrContentCap);
+  for (int i = 0; i < MUA_MAX_TOOL_CALLS; i++) {
+    buf_init(&stream->tool_calls[i].args, kOrToolArgsCap);
+  }
+}
+
+static void accumulators_free(OpenrouterStream *stream)
+{
+  buf_free(&stream->content);
+  for (int i = 0; i < MUA_MAX_TOOL_CALLS; i++) {
+    buf_free(&stream->tool_calls[i].args);
+  }
+}
 
 static void fire_error_msg(OpenrouterStream *stream, ErrorType type, const char *msg)
 {
@@ -68,16 +101,114 @@ static void fire_error_msg(OpenrouterStream *stream, ErrorType type, const char 
   api_clear_error(&err);
 }
 
+// Assembles the complete wire-shaped assistant message from the accumulators.
+// Caller (fire_done) has already validated that present calls are complete.
+static cJSON *assemble_message(OpenrouterStream *stream)
+{
+  cJSON *msg = json_new_obj();
+  json_add_cstr(msg, "role", "assistant");
+  if (stream->content.size > 0) {
+    json_add_str(msg, "content",
+                 (String){.data = stream->content.data, .size = stream->content.size});
+  } else {
+    cJSON_AddItemToObject(msg, "content", cJSON_CreateNull());
+  }
+  bool any = false;
+  for (int i = 0; i < stream->tool_calls_hwm; i++) {
+    any = any || stream->tool_calls[i].present;
+  }
+  if (!any) {
+    return msg; // content-only response: no tool_calls key at all
+  }
+  cJSON *calls = json_add_arr(msg, "tool_calls");
+  for (int i = 0; i < stream->tool_calls_hwm; i++) {
+    OrToolCall *call = &stream->tool_calls[i];
+    if (!call->present) {
+      log_msg(kLogWarn, "openrouter: tool_call index gap at %d; skipping", i);
+      continue;
+    }
+    cJSON *entry = cJSON_CreateObject();
+    json_add_cstr(entry, "id", call->id);
+    json_add_cstr(entry, "type", "function");
+    cJSON *function = json_new_obj();
+    json_add_cstr(function, "name", call->name);
+    json_add_str(function, "arguments", (String){.data = call->args.data, .size = call->args.size});
+    cJSON_AddItemToObject(entry, "function", function);
+    cJSON_AddItemToArray(calls, entry);
+  }
+  return msg;
+}
+
 static void fire_done(OpenrouterStream *stream)
 {
   if (stream->finished) {
     return;
   }
+  for (int i = 0; i < stream->tool_calls_hwm; i++) {
+    OrToolCall *call = &stream->tool_calls[i];
+    if (call->present && (call->id[0] == '\0' || call->name[0] == '\0')) {
+      // An assembled-but-incomplete call would corrupt the session replay.
+      fire_error_msg(stream, kErrorTypeException, "incomplete tool call in stream");
+      return;
+    }
+  }
   stream->finished = true;
   String reason = cstr_as_string(stream->finish_reason);
   if (stream->cb.on_done != NULL) {
-    stream->cb.on_done(stream->ud, &reason, stream->completion_tokens);
+    cJSON *msg = assemble_message(stream); // ownership transfers to the callee
+    stream->cb.on_done(stream->ud, msg, &reason, stream->completion_tokens);
   }
+}
+
+// Folds one delta.tool_calls array into the per-index accumulators. Returns
+// false after firing a terminal error: caps are never silently truncated (a
+// truncated assembled message would corrupt the session).
+static bool accumulate_tool_calls(OpenrouterStream *stream, const cJSON *items)
+{
+  int count = 0;
+  for (const cJSON *item = items->child; item != NULL; item = item->next) {
+    if (++count > kOrToolItemsPerEvent) {
+      fire_error_msg(stream, kErrorTypeException, "too many tool_call items in one event");
+      return false;
+    }
+    int64_t index = -1;
+    if (!json_get_int(item, "index", &index) || index < 0 || index >= MUA_MAX_TOOL_CALLS) {
+      fire_error_msg(stream, kErrorTypeException, "tool_call index missing or out of range");
+      return false;
+    }
+    OrToolCall *call = &stream->tool_calls[index];
+    call->present = true;
+    if ((int)index + 1 > stream->tool_calls_hwm) {
+      stream->tool_calls_hwm = (int)index + 1;
+    }
+    stream->delivered = true; // the model began answering; a retry could re-bill
+    const char *id = json_get_cstr(item, "id");
+    if (id != NULL && id[0] != '\0' && call->id[0] == '\0') { // latch the first fragment's
+      if (strlen(id) >= sizeof(call->id)) {
+        fire_error_msg(stream, kErrorTypeException, "tool_call id exceeds cap");
+        return false;
+      }
+      memcpy(call->id, id, strlen(id) + 1);
+    }
+    const cJSON *function = json_get_obj(item, "function");
+    if (function == NULL) {
+      continue; // a fragment may carry only index/id
+    }
+    const char *name = json_get_cstr(function, "name");
+    if (name != NULL && name[0] != '\0' && call->name[0] == '\0') {
+      if (strlen(name) >= sizeof(call->name)) {
+        fire_error_msg(stream, kErrorTypeException, "tool_call name exceeds cap");
+        return false;
+      }
+      memcpy(call->name, name, strlen(name) + 1);
+    }
+    const char *args = json_get_cstr(function, "arguments");
+    if (args != NULL && args[0] != '\0' && !buf_append(&call->args, args, strlen(args))) {
+      fire_error_msg(stream, kErrorTypeException, "tool_call arguments exceed cap");
+      return false;
+    }
+  }
+  return true;
 }
 
 bool openrouter_handle_event(OpenrouterStream *stream, String data)
@@ -117,11 +248,21 @@ bool openrouter_handle_event(OpenrouterStream *stream, String data)
     cJSON *delta = json_get_obj(choice, "delta");
     const char *content = (delta != NULL) ? json_get_cstr(delta, "content") : NULL;
     if (content != NULL && content[0] != '\0') {
+      if (!buf_append(&stream->content, content, strlen(content))) {
+        fire_error_msg(stream, kErrorTypeException, "assistant content exceeds cap");
+        json_free(doc);
+        return false;
+      }
       stream->delivered = true;
       if (stream->cb.on_text != NULL) {
         String text = cstr_as_string(content);
         stream->cb.on_text(stream->ud, &text);
       }
+    }
+    cJSON *calls = (delta != NULL) ? json_get_arr(delta, "tool_calls") : NULL;
+    if (calls != NULL && !accumulate_tool_calls(stream, calls)) {
+      json_free(doc);
+      return false;
     }
     const char *finish = json_get_cstr(choice, "finish_reason");
     if (finish != NULL) {
@@ -335,6 +476,19 @@ static void start_attempt(OpenrouterStream *stream)
   stream->mode = kOrModeUndecided;
   stream->wrong_ctype = false;
   stream->http_status = 0;
+  // Full per-attempt reset: a retry must never inherit a prior attempt's
+  // latches or accumulators. `delivered` deliberately persists — it gates
+  // whether a retry is allowed at all.
+  stream->finish_reason[0] = '\0';
+  stream->completion_tokens = 0;
+  buf_reset(&stream->content);
+  for (int i = 0; i < MUA_MAX_TOOL_CALLS; i++) {
+    stream->tool_calls[i].present = false;
+    stream->tool_calls[i].id[0] = '\0';
+    stream->tool_calls[i].name[0] = '\0';
+    buf_reset(&stream->tool_calls[i].args);
+  }
+  stream->tool_calls_hwm = 0;
   stream->attempt++;
   const char *headers[] = {
     stream->auth_header,
@@ -369,11 +523,13 @@ static String build_body(const OpenrouterOpts *opts)
   if (opts->max_tokens > 0) {
     json_add_int(body, "max_tokens", opts->max_tokens);
   }
-  cJSON *messages = json_add_arr(body, "messages");
-  cJSON *message = cJSON_CreateObject();
-  json_add_cstr(message, "role", "user");
-  json_add_str(message, "content", opts->prompt);
-  cJSON_AddItemToArray(messages, message);
+  // Zero-copy request build: a reference array borrows the caller's items
+  // (the array's first element, not the array node) for the print, and
+  // json_free(body) skips reference children — verified, cJSON 1.7.18.
+  cJSON_AddItemToObject(body, "messages", cJSON_CreateArrayReference(opts->messages->child));
+  if (opts->tools != NULL && opts->tools->child != NULL) {
+    cJSON_AddItemToObject(body, "tools", cJSON_CreateArrayReference(opts->tools->child));
+  }
   String printed = json_print(body);
   json_free(body);
   return printed;
@@ -411,6 +567,7 @@ static void retry_timer_closed(uv_handle_t *handle)
   xfree(stream->body.data);
   sse_parser_free(stream->sse);
   buf_free(&stream->error_body);
+  accumulators_free(stream);
   xfree(stream);
 }
 
@@ -430,8 +587,13 @@ OpenrouterStream *openrouter_stream(HttpClient *http, const OpenrouterOpts *opts
     api_set_error(err, kErrorTypeValidation, "openrouter: api key is required");
     return NULL;
   }
-  if (opts->prompt.data == NULL || opts->prompt.size == 0) {
-    api_set_error(err, kErrorTypeValidation, "openrouter: prompt is empty");
+  // ->child == NULL would silently print "messages":[] and earn an API 400.
+  if (!cJSON_IsArray(opts->messages) || opts->messages->child == NULL) {
+    api_set_error(err, kErrorTypeValidation, "openrouter: messages must be a non-empty array");
+    return NULL;
+  }
+  if (opts->tools != NULL && !cJSON_IsArray(opts->tools)) {
+    api_set_error(err, kErrorTypeValidation, "openrouter: tools must be an array");
     return NULL;
   }
   OpenrouterStream *stream = xcalloc(1, sizeof(*stream));
@@ -449,6 +611,7 @@ OpenrouterStream *openrouter_stream(HttpClient *http, const OpenrouterOpts *opts
   memcpy(stream->auth_header + sizeof(bearer_prefix) - 1, opts->api_key, key_len + 1);
   stream->sse = sse_parser_new(NULL, or_on_event, stream);
   buf_init(&stream->error_body, kOrErrorBodyCap);
+  accumulators_init(stream);
   stream->prng_state = uv_hrtime() | 1U; // seeded once; never zero
   if (uv_timer_init(http_client_loop(http), &stream->retry_timer) != 0) {
     stream_destroy(stream);
@@ -481,10 +644,17 @@ OpenrouterStream *openrouter_stream_new_for_test(const OpenrouterCallbacks *cb, 
   OpenrouterStream *stream = xcalloc(1, sizeof(*stream));
   stream->cb = *cb;
   stream->ud = ud;
+  accumulators_init(stream);
   return stream;
 }
 
 void openrouter_stream_free_for_test(OpenrouterStream *stream)
 {
+  accumulators_free(stream);
   xfree(stream);
+}
+
+bool openrouter_stream_delivered_for_test(const OpenrouterStream *stream)
+{
+  return stream->delivered;
 }
