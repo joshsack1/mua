@@ -57,6 +57,15 @@ AgentTurn *agent_turn_start(const AgentOpts *opts, const AgentCallbacks *cb, voi
 // on_finish still fires (kTurnInterrupted).
 void agent_turn_cancel(AgentTurn *turn);
 
+// Heals a resumed session whose tail is an assistant message with unanswered
+// tool_calls -- the crash/poison artifact a live cancel would have filled.
+// Appends a synthetic role:"tool" "[interrupted]" result for every call id
+// not already answered, so the next request is well-formed (a dangling call
+// makes every resumed request 400). A no-op when nothing dangles. Call once
+// after a resume load, before the first turn. false + err only on an append
+// failure.
+bool agent_repair_session(SessionState *sess, Error *err);
+
 // The three gate policies, next to the loop (policy, not tools.c mechanism).
 GateDecision agent_gate_interactive(void *ud, const ToolDef *tool, const cJSON *args,
                                     char **refusal_out); // blocking y/N on stderr/stdin

@@ -396,6 +396,68 @@ void agent_turn_cancel(AgentTurn *turn)
   // next iteration boundary, which then writes the synthetics.
 }
 
+// The highest-index assistant message bearing a non-empty tool_calls array,
+// or -1. Only the last such round can dangle: the loop fully answers every
+// round before the next, so an earlier round is always complete.
+static int last_tool_call_round(const SessionState *sess, const cJSON **calls_out)
+{
+  size_t count = session_message_count(sess);
+  for (size_t i = count; i > 0; i--) { // bounded by the message count
+    const cJSON *msg = session_message_get(sess, i - 1);
+    const char *role = json_get_cstr(msg, "role");
+    if (role == NULL || strcmp(role, "assistant") != 0) {
+      continue;
+    }
+    const cJSON *calls = json_get_arr(msg, "tool_calls");
+    if (calls != NULL && cJSON_GetArraySize(calls) > 0) {
+      *calls_out = calls;
+      return (int)(i - 1);
+    }
+  }
+  return -1;
+}
+
+// Whether some role:"tool" message after index `from` answers `id`.
+static bool call_answered(const SessionState *sess, size_t from, const char *id)
+{
+  size_t count = session_message_count(sess);
+  for (size_t i = from; i < count; i++) { // bounded by the message count
+    const cJSON *msg = session_message_get(sess, i);
+    const char *role = json_get_cstr(msg, "role");
+    const char *tid = json_get_cstr(msg, "tool_call_id");
+    if (role != NULL && strcmp(role, "tool") == 0 && tid != NULL && id != NULL &&
+        strcmp(tid, id) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool agent_repair_session(SessionState *sess, Error *err)
+{
+  const cJSON *calls = NULL;
+  int round = last_tool_call_round(sess, &calls);
+  if (round < 0) {
+    return true; // nothing dangles
+  }
+  int n = cJSON_GetArraySize(calls); // bounded by MUA_MAX_TOOL_CALLS on the wire
+  for (int i = 0; i < n; i++) {
+    const cJSON *call = cJSON_GetArrayItem(calls, i);
+    const char *id = (call != NULL) ? json_get_cstr(call, "id") : NULL;
+    if (call_answered(sess, (size_t)round + 1, id)) {
+      continue;
+    }
+    cJSON *msg = json_new_obj();
+    json_add_cstr(msg, "role", "tool");
+    json_add_cstr(msg, "tool_call_id", id != NULL ? id : "");
+    json_add_cstr(msg, "content", "[interrupted]");
+    if (!session_append(sess, msg, err)) {
+      return false; // session_append owned and freed msg
+    }
+  }
+  return true;
+}
+
 AgentTurn *agent_turn_start(const AgentOpts *opts, const AgentCallbacks *cb, void *ud,
                             String user_text, Error *err)
 {
