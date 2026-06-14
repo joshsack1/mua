@@ -15,7 +15,7 @@ Planned order; nothing below exists yet:
 1. **Agent milestone** — sessions, tool calling, the four built-in tools, the agent loop, a line-based REPL. Spans many commits; tracked as its own section below.
 2. **`mua.api` + Lua bridge** — the identity feature, after the agent exists so it wraps settled behavior: `src/mua/api/{global,session,tools}.c` with `FUNC_API_SINCE` and table-driven dispatch, mechanical `mua.api.mua_*` registration, the autocmd event set, `mua_register_tool` from Lua, and the `mua.o`/`mua.g` sugar in `runtime/lua/mua/`.
 
-Housekeeping, slotted whenever: CI running the full gauntlet (`make && make test && make lint` plus the `SANITIZE=1` suites); a LICENSE decision before the repo goes public (none exists yet, deliberately; Apache-2.0 would match neovim); a `MUA_HTTP_STALL_WINDOW_S` env override so stall detection becomes functionally testable against the fixture server.
+Housekeeping, slotted whenever: CI running the full gauntlet (`make && make test && make lint` plus the `SANITIZE=1` suites); a LICENSE decision before the repo goes public (none exists yet, deliberately; Apache-2.0 would match neovim); a `MUA_HTTP_STALL_WINDOW_S` env override so stall detection becomes functionally testable against the fixture server; surface OpenRouter's `error.metadata.raw` in the provider's error message (`report_http_failure` in [openrouter.c](src/mua/provider/openrouter.c) prints only the top-level `error.message`, which is often a useless `"Provider returned error"` — the real upstream cause and the routing/provider detail live in `metadata.raw`, e.g. `"messages: at least one message is required"`; discarding it turned a one-line request-shape bug into a long diagnosis).
 
 ## Agent milestone
 
