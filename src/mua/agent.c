@@ -33,6 +33,9 @@ struct AgentTurn {
   int step_cap;
   OpenrouterStream *stream; // live while streaming, else NULL
   ToolExec *exec;           // live while an async tool runs, else NULL
+  uv_timer_t step_timer;    // 0-ms deferral: the next request must be issued
+                            // outside provider (curl) callbacks, where
+                            // curl_multi_add_handle is illegal
   const cJSON *assistant;   // borrowed from the session: this step's message
   const cJSON *calls;       // borrowed tool_calls array of `assistant`
   int tool_index;
@@ -92,8 +95,18 @@ static int resolve_step_cap(void)
   return (int)value;
 }
 
+// Frees the turn once its step_timer has closed (libuv needs the handle
+// memory until the close callback runs).
+static void turn_free_cb(uv_handle_t *handle)
+{
+  AgentTurn *turn = handle->data;
+  xfree(turn->system_prompt);
+  xfree(turn);
+}
+
 // The single exit: latches, disarms SIGINT, fires on_finish exactly once,
-// clears `err` (which may point into the turn), and frees the turn.
+// clears `err` (which may point into the turn), and frees the turn after the
+// step_timer closes.
 static void finish_turn(AgentTurn *turn, TurnOutcome outcome, Error *err)
 {
   if (turn->finished) {
@@ -104,8 +117,7 @@ static void finish_turn(AgentTurn *turn, TurnOutcome outcome, Error *err)
   loop_set_interrupt_cb(NULL, NULL); // a later SIGINT must not touch a freed turn
   turn->cb.on_finish(turn->ud, outcome, err);
   api_clear_error(err);
-  xfree(turn->system_prompt);
-  xfree(turn);
+  uv_close((uv_handle_t *)&turn->step_timer, turn_free_cb); // frees the turn next tick
 }
 
 static void drive_tools(AgentTurn *turn);
@@ -337,7 +349,11 @@ static bool issue_request(AgentTurn *turn, Error *err)
     json_add_cstr(system, "content", turn->system_prompt);
     cJSON_AddItemToArray(request_messages, system);
     for (const cJSON *msg = messages->child; msg != NULL; msg = msg->next) { // <= 4096
-      cJSON_AddItemToArray(request_messages, cJSON_CreateObjectReference(msg));
+      // A reference (shallow copy with next/prev cleared) so the message
+      // appears as a sibling element. cJSON_CreateObjectReference would instead
+      // nest it as a single empty-keyed field ({"": {...}}), dropping its role.
+      // The cast is safe: AddItemReference only reads the borrowed node.
+      cJSON_AddItemReferenceToArray(request_messages, (cJSON *)msg);
     }
     messages = request_messages;
   }
@@ -358,6 +374,24 @@ static bool issue_request(AgentTurn *turn, Error *err)
   return turn->stream != NULL;
 }
 
+// Issues the next request from a fresh loop tick. The deferral is mandatory:
+// a tool round can complete synchronously inside provider_on_done (a curl
+// write callback), and curl_multi_add_handle is illegal there. Arms the same
+// timer used for the first request.
+static void step_timer_cb(uv_timer_t *handle)
+{
+  AgentTurn *turn = handle->data;
+  if (turn->canceling || turn->cancel_requested) {
+    Error none = ERROR_INIT; // canceled while waiting between steps
+    finish_turn(turn, kTurnInterrupted, &none);
+    return;
+  }
+  Error err = ERROR_INIT;
+  if (!issue_request(turn, &err)) {
+    finish_turn(turn, kTurnFailed, &err);
+  }
+}
+
 static void next_step(AgentTurn *turn)
 {
   turn->step++;
@@ -366,8 +400,9 @@ static void next_step(AgentTurn *turn)
     finish_turn(turn, kTurnStepCap, &none); // stop, never loop
     return;
   }
-  Error err = ERROR_INIT;
-  if (!issue_request(turn, &err)) {
+  if (uv_timer_start(&turn->step_timer, step_timer_cb, 0, 0) != 0) {
+    Error err = ERROR_INIT;
+    api_set_error(&err, kErrorTypeException, "agent: step timer failed");
     finish_turn(turn, kTurnFailed, &err);
   }
 }
@@ -482,12 +517,23 @@ AgentTurn *agent_turn_start(const AgentOpts *opts, const AgentCallbacks *cb, voi
   turn->ud = ud;
   turn->system_prompt = resolve_system_prompt();
   turn->step_cap = resolve_step_cap();
-  if (!issue_request(turn, err)) {
+  if (uv_timer_init(loop_get(), &turn->step_timer) != 0) {
+    api_set_error(err, kErrorTypeException, "agent: step timer init failed");
     xfree(turn->system_prompt);
     xfree(turn);
+    return NULL;
+  }
+  turn->step_timer.data = turn;
+  // Every request, the first included, is issued from the step timer rather
+  // than inline -- provider callbacks run inside curl's stack. A first-request
+  // failure therefore surfaces via on_finish(kTurnFailed), not a NULL return.
+  loop_set_interrupt_cb(agent_interrupt_cb, turn);
+  if (uv_timer_start(&turn->step_timer, step_timer_cb, 0, 0) != 0) {
+    api_set_error(err, kErrorTypeException, "agent: step timer start failed");
+    loop_set_interrupt_cb(NULL, NULL);
+    uv_close((uv_handle_t *)&turn->step_timer, turn_free_cb);
     return NULL; // the user message stays in the session: an honest record
   }
-  loop_set_interrupt_cb(agent_interrupt_cb, turn);
   return turn;
 }
 

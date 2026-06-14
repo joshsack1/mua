@@ -5,44 +5,14 @@ local helpers = require("test.functional.helpers")
 -- Boundary hostility here is best-effort (the kernel may coalesce slices);
 -- split-invariance itself is owned by the unit suite.
 
-local SSE_OK = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
-
-local function ev(payload)
-  return "data: " .. payload .. "\n\n"
-end
-
-local function delta(text)
-  return ev('{"choices":[{"delta":{"content":"' .. text .. '"}}]}')
-end
-
-local FINISH = ev('{"choices":[{"delta":{},"finish_reason":"stop"}]}')
-local DONE = ev("[DONE]")
-
-local function mua_env(srv)
-  return {
-    OPENROUTER_API_KEY = "test-key-123",
-    OPENROUTER_BASE_URL = srv.url,
-    MUA_CONFIG_DIR = "test/functional/fixtures/nonexistent",
-    MUA_LOG = "", -- insulate stderr assertions from a developer's MUA_LOG
-  }
-end
-
---- Slice `wire` at the given absolute offsets into send directives separated
---- by short sleeps (paced delivery makes boundary placement deterministic in
---- practice), ending with the given terminator.
-local function sliced_block(wire, cuts, terminator)
-  local block = {}
-  local prev = 0
-  for _, cut in ipairs(cuts) do
-    assert(cut > prev and cut < #wire, "bad cut offset")
-    block[#block + 1] = { "send", wire:sub(prev + 1, cut) }
-    block[#block + 1] = { "sleep", 10 }
-    prev = cut
-  end
-  block[#block + 1] = { "send", wire:sub(prev + 1) }
-  block[#block + 1] = { terminator }
-  return block
-end
+-- Wire builders, mua_env (now isolating MUA_STATE_DIR), and sliced_block are
+-- shared via helpers; the agent specs reuse them too.
+local SSE_OK = helpers.SSE_OK
+local delta = helpers.delta
+local FINISH = helpers.FINISH
+local DONE = helpers.DONE
+local mua_env = helpers.mua_env
+local sliced_block = helpers.sliced_block
 
 describe("streaming against the fixture server", function()
   it("happy path with hostile slice boundaries and keep-alive comments", function()

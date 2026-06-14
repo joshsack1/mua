@@ -7,13 +7,15 @@
 #include <cjson/cJSON.h>
 
 #include "auto/versiondef.h"
+#include "mua/agent.h"
 #include "mua/api/private/helpers.h"
 #include "mua/http.h"
 #include "mua/json.h"
 #include "mua/log.h"
 #include "mua/loop.h"
 #include "mua/lua/state.h"
-#include "mua/provider/openrouter.h"
+#include "mua/memory.h"
+#include "mua/session.h"
 
 enum {
   kExitOk = 0,
@@ -22,25 +24,35 @@ enum {
   kExitInterrupted = 130,
 };
 
+enum {
+  kReplLine = 8192,
+  kReplDrainMax = 1 << 20,
+  kToolArgPreview = 120,
+  kOutcomeUnset = -1, // distinguishes a second-SIGINT loop stop from a real finish
+};
+
 typedef struct {
   bool version;
   bool help;
+  bool yes;
+  bool resume;
   const char *prompt;
+  const char *model;
 } MuaArgs;
 
 typedef struct {
-  OpenrouterStream *stream; // NULLed when a terminal callback fires
-  int exit_code;
+  AgentTurn *turn; // set before loop_run; nulled in on_finish
+  int outcome;     // kOutcomeUnset until on_finish fires
   bool wrote_any;
   bool last_was_newline;
-  bool interrupted;
-  bool failed_write;
-} PromptRun;
+  bool failed_write; // a stdout write failed (EPIPE under `| head`)
+} TurnCtx;
 
 static void print_usage(FILE *stream)
 {
-  // Failing to print usage is unrecoverable and irrelevant to the exit path.
-  (void)fprintf(stream, "Usage: mua [--version] [--help] [-p TEXT]\n");
+  // Diagnostic path; nothing to do if the stream is gone.
+  (void)fprintf(stream, "Usage: mua [--version] [--help] [-p TEXT] [-y|--yes] "
+                        "[-r|--resume] [-m|--model MODEL]\n");
 }
 
 static bool parse_args(int argc, char **argv, MuaArgs *out)
@@ -48,19 +60,30 @@ static bool parse_args(int argc, char **argv, MuaArgs *out)
   *out = (MuaArgs){0};
   for (int i = 1; i < argc; i++) {
     const char *arg = argv[i];
+    const char *value = (i + 1 < argc) ? argv[i + 1] : NULL;
     if (strcmp(arg, "--version") == 0) {
       out->version = true;
     } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
       out->help = true;
+    } else if (strcmp(arg, "-y") == 0 || strcmp(arg, "--yes") == 0) {
+      out->yes = true;
+    } else if (strcmp(arg, "-r") == 0 || strcmp(arg, "--resume") == 0) {
+      out->resume = true;
     } else if (strcmp(arg, "-p") == 0 || strcmp(arg, "--prompt") == 0) {
-      if (i + 1 >= argc) {
+      if (value == NULL) {
         (void)fprintf(stderr, "mua: missing argument for %s\n", arg);
         return false;
       }
+      out->prompt = value;
       i++;
-      out->prompt = argv[i];
+    } else if (strcmp(arg, "-m") == 0 || strcmp(arg, "--model") == 0) {
+      if (value == NULL) {
+        (void)fprintf(stderr, "mua: missing argument for %s\n", arg);
+        return false;
+      }
+      out->model = value;
+      i++;
     } else {
-      // Diagnostic on a failing path; nothing to do if stderr is gone.
       (void)fprintf(stderr, "mua: unknown argument: %s\n", arg);
       return false;
     }
@@ -68,63 +91,170 @@ static bool parse_args(int argc, char **argv, MuaArgs *out)
   return true;
 }
 
-static void prompt_on_text(void *ud, const String *text)
+static void on_text(void *ud, const String *text)
 {
-  PromptRun *run = ud;
-  if (run->failed_write || text->size == 0) {
+  TurnCtx *ctx = ud;
+  if (ctx->failed_write || text->size == 0) {
     return;
   }
   if (fwrite(text->data, 1, text->size, stdout) != text->size || fflush(stdout) != 0) {
-    // stdout is gone (EPIPE under `mua -p ... | head`): stop streaming.
-    run->failed_write = true;
-    run->exit_code = kExitFailure;
-    openrouter_cancel(run->stream);
+    ctx->failed_write = true; // stdout is gone; stop the turn
+    agent_turn_cancel(ctx->turn);
     return;
   }
-  run->wrote_any = true;
-  run->last_was_newline = (text->data[text->size - 1] == '\n');
+  ctx->wrote_any = true;
+  ctx->last_was_newline = (text->data[text->size - 1] == '\n');
 }
 
-static void prompt_on_done(void *ud, cJSON *message, const String *finish_reason,
-                           int64_t completion_tokens)
+static void on_tool_start(void *ud, const char *name, const cJSON *args)
 {
-  PromptRun *run = ud;
-  json_free(message); // ownership transferred by on_done; the agent loop will keep it
-  log_msg(kLogInfo, "stream done: finish_reason=%.*s completion_tokens=%lld",
-          (int)finish_reason->size, finish_reason->data != NULL ? finish_reason->data : "",
-          (long long)completion_tokens);
-  if (run->wrote_any && !run->last_was_newline && !run->failed_write) {
-    (void)fputc('\n', stdout); // cosmetic trailing newline; best-effort
-  }
-  if (!run->failed_write) {
-    run->exit_code = kExitOk;
-  }
-  run->stream = NULL;
+  (void)ud;
+  String preview = json_print(args);
+  int shown = (int)(preview.size < kToolArgPreview ? preview.size : kToolArgPreview);
+  (void)fprintf(stderr, "mua: -> %s %.*s%s\n", name, shown,
+                preview.data != NULL ? preview.data : "",
+                preview.size > kToolArgPreview ? "..." : "");
+  xfree(preview.data);
 }
 
-static void prompt_on_error(void *ud, const Error *err)
+static void on_tool_result(void *ud, const char *name, const ToolResult *result)
 {
-  PromptRun *run = ud;
-  run->stream = NULL;
-  if (run->interrupted) {
-    run->exit_code = kExitInterrupted;
-    return;
-  }
-  if (run->failed_write) {
-    return; // self-inflicted cancel; the exit code is already set
-  }
-  (void)fprintf(stderr, "mua: %s\n", err->msg != NULL ? err->msg : "request failed");
-  run->exit_code = kExitFailure;
+  (void)ud;
+  (void)fprintf(stderr, "mua: <- %s: %s\n", name, result->is_error ? "error" : "ok");
 }
 
-static void prompt_interrupt(void *ud)
+static void on_finish(void *ud, TurnOutcome outcome, const Error *err)
 {
-  PromptRun *run = ud;
-  run->interrupted = true;
-  openrouter_cancel(run->stream); // NULL-safe after a terminal callback
+  TurnCtx *ctx = ud;
+  ctx->outcome = (int)outcome;
+  // Cosmetic trailing newline on success only; an error/interrupt leaves the
+  // partial output as-is and explains itself on stderr.
+  if (outcome == kTurnDone && ctx->wrote_any && !ctx->last_was_newline && !ctx->failed_write) {
+    (void)fputc('\n', stdout);
+    (void)fflush(stdout);
+  }
+  if (!ctx->failed_write) {
+    if (outcome == kTurnFailed) {
+      (void)fprintf(stderr, "mua: %s\n", (err != NULL && err->msg != NULL) ? err->msg : "failed");
+    } else if (outcome == kTurnStepCap) {
+      (void)fprintf(stderr, "mua: step cap reached\n");
+    } else if (outcome == kTurnInterrupted) {
+      (void)fprintf(stderr, "mua: interrupted\n");
+    }
+  }
+  ctx->turn = NULL;
 }
 
-static int run_prompt(const char *prompt)
+// Resolves the session: a fresh one, or the resumed latest (repaired). A
+// missing latest is a notice + fresh start; a corrupt one fails hard so the
+// data loss is never silently hidden. NULL + err on a hard failure.
+static SessionState *setup_session(bool resume, Error *err)
+{
+  if (!resume) {
+    return session_new(err);
+  }
+  SessionState *sess = session_load_latest(err);
+  if (sess == NULL) {
+    if (err->msg != NULL && strstr(err->msg, "no sessions to resume") != NULL) {
+      api_clear_error(err);
+      (void)fprintf(stderr, "mua: no session to resume; starting a new one\n");
+      return session_new(err);
+    }
+    return NULL; // corrupt latest (or worse): the caller reports err
+  }
+  if (!agent_repair_session(sess, err)) {
+    session_free(sess);
+    return NULL;
+  }
+  return sess;
+}
+
+// Runs one turn to completion. Returns the exit code; *hard_stop is set when a
+// second SIGINT stopped the loop with the turn unfinished (on_finish never
+// fired) so the REPL can quit rather than reprompt.
+static int run_one_turn(HttpClient *http, SessionState *sess, AgentGateFn gate, const char *model,
+                        const char *api_key, const char *text, bool *hard_stop)
+{
+  *hard_stop = false;
+  TurnCtx ctx = {.turn = NULL, .outcome = kOutcomeUnset};
+  AgentOpts opts = {.http = http, .session = sess, .model = model, .api_key = api_key};
+  AgentCallbacks cbs = {.on_text = on_text,
+                        .on_tool_start = on_tool_start,
+                        .on_tool_result = on_tool_result,
+                        .gate = gate,
+                        .on_finish = on_finish};
+  loop_run_nowait(); // drain a SIGINT pressed at the prompt before arming the turn
+  Error err = ERROR_INIT;
+  ctx.turn = agent_turn_start(&opts, &cbs, &ctx, cstr_as_string(text), &err);
+  if (ctx.turn == NULL) {
+    (void)fprintf(stderr, "mua: %s\n", err.msg != NULL ? err.msg : "cannot start turn");
+    api_clear_error(&err);
+    return kExitFailure;
+  }
+  (void)loop_run();
+  if (ctx.outcome == kOutcomeUnset) {
+    *hard_stop = true; // second SIGINT: the loop stopped, the turn is unfinished
+    return kExitInterrupted;
+  }
+  if (ctx.failed_write) {
+    return kExitFailure; // EPIPE outranks the cancel it triggered
+  }
+  if (ctx.outcome == kTurnDone) {
+    return kExitOk;
+  }
+  return ctx.outcome == kTurnInterrupted ? kExitInterrupted : kExitFailure;
+}
+
+static void drain_line(void)
+{
+  for (int i = 0; i < kReplDrainMax; i++) { // bounded
+    int c = getchar();
+    if (c == '\n' || c == EOF) {
+      return;
+    }
+  }
+}
+
+static int run_repl(HttpClient *http, SessionState *sess, const char *model, const char *api_key,
+                    bool yes)
+{
+  AgentGateFn gate = yes ? agent_gate_approve_all : agent_gate_interactive;
+  (void)fprintf(stderr, "mua %s -- type 'exit' or Ctrl-D to quit\n", MUA_VERSION_STRING);
+  char line[kReplLine];
+  for (;;) {
+    (void)fprintf(stderr, "mua> ");
+    (void)fflush(stderr);
+    if (fgets(line, sizeof line, stdin) == NULL) {
+      (void)fputc('\n', stderr);
+      if (feof(stdin)) {
+        return kExitOk; // Ctrl-D
+      }
+      clearerr(stdin); // Ctrl-C at the prompt: fresh line
+      continue;
+    }
+    size_t len = strlen(line);
+    if (len > 0 && line[len - 1] == '\n') {
+      line[len - 1] = '\0';
+    } else if (len == sizeof line - 1) {
+      drain_line();
+      (void)fprintf(stderr, "mua: input too long; ignored\n");
+      continue;
+    }
+    if (line[0] == '\0') {
+      continue; // empty line reprompts
+    }
+    if (strcmp(line, "exit") == 0 || strcmp(line, "quit") == 0) {
+      return kExitOk;
+    }
+    bool hard_stop = false;
+    int code = run_one_turn(http, sess, gate, model, api_key, line, &hard_stop);
+    if (hard_stop) {
+      return code; // second SIGINT exits the REPL
+    }
+  }
+}
+
+static int run_agent(const MuaArgs *args)
 {
   const char *api_key = getenv("OPENROUTER_API_KEY");
   if (api_key == NULL || api_key[0] == '\0') {
@@ -138,31 +268,22 @@ static int run_prompt(const char *prompt)
     api_clear_error(&err);
     return kExitFailure;
   }
-  PromptRun run = {.exit_code = kExitFailure};
-  cJSON *messages = cJSON_CreateArray();
-  cJSON *message = cJSON_CreateObject();
-  json_add_cstr(message, "role", "user");
-  json_add_cstr(message, "content", prompt);
-  cJSON_AddItemToArray(messages, message);
-  OpenrouterOpts opts = {.messages = messages, .api_key = api_key};
-  OpenrouterCallbacks cbs = {
-    .on_text = prompt_on_text,
-    .on_done = prompt_on_done,
-    .on_error = prompt_on_error,
-  };
-  run.stream = openrouter_stream(http, &opts, &cbs, &run, &err);
-  json_free(messages); // borrowed only for the call: the body is already printed
-  if (run.stream == NULL) {
-    (void)fprintf(stderr, "mua: %s\n", err.msg != NULL ? err.msg : "request failed");
+  int code = kExitFailure;
+  SessionState *sess = setup_session(args->resume, &err);
+  if (sess == NULL) {
+    (void)fprintf(stderr, "mua: %s\n", err.msg != NULL ? err.msg : "cannot open session");
     api_clear_error(&err);
+  } else if (args->prompt != NULL) {
+    AgentGateFn gate = args->yes ? agent_gate_approve_all : agent_gate_auto_refuse;
+    bool hard_stop = false;
+    code = run_one_turn(http, sess, gate, args->model, api_key, args->prompt, &hard_stop);
   } else {
-    loop_set_interrupt_cb(prompt_interrupt, &run);
-    (void)loop_run(); // returns once the stream (and its handles) finished
-    loop_set_interrupt_cb(NULL, NULL);
+    code = run_repl(http, sess, args->model, api_key, args->yes);
   }
+  session_free(sess); // NULL-safe; the turn borrowed it and is finished
   http_client_close(http);
-  (void)loop_run(); // drain the client's deferred teardown
-  return run.exit_code;
+  (void)loop_run(); // drain the client's deferred handle closes
+  return code;
 }
 
 static int run(const MuaArgs *args)
@@ -177,14 +298,14 @@ static int run(const MuaArgs *args)
     (void)fprintf(stderr, "mua: failed to initialize lua\n");
     code = kExitFailure;
   } else {
-    // Broken user config is nonfatal by contract; sourcing only fails on
+    // A broken init.lua is nonfatal by contract; sourcing fails only on
     // internal errors.
     if (!mua_lua_source_init()) {
       (void)fprintf(stderr, "mua: failed to source init.lua\n");
       code = kExitFailure;
     }
-    if (code == kExitOk && args->prompt != NULL) {
-      code = run_prompt(args->prompt);
+    if (code == kExitOk) {
+      code = run_agent(args);
     }
   }
   mua_lua_teardown();

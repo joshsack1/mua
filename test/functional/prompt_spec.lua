@@ -13,6 +13,7 @@ describe("mua -p", function()
     local r = helpers.run_mua({ "-p", "hi" }, {
       OPENROUTER_API_KEY = "",
       MUA_CONFIG_DIR = "test/functional/fixtures/nonexistent",
+      MUA_STATE_DIR = helpers.tmpdir(),
     })
     assert.equal(1, r.code)
     assert.truthy(r.stderr:match("OPENROUTER_API_KEY"))
@@ -28,6 +29,7 @@ describe("mua -p", function()
   it("streams a completion (live)", function()
     local r = helpers.run_mua({ "-p", "Reply with exactly: hello" }, {
       MUA_CONFIG_DIR = "test/functional/fixtures/nonexistent",
+      MUA_STATE_DIR = helpers.tmpdir(),
     })
     assert.equal(0, r.code)
     assert.truthy(r.stdout:lower():match("hello"))
@@ -37,6 +39,7 @@ describe("mua -p", function()
     local r = helpers.run_mua({ "-p", "hi" }, {
       OPENROUTER_API_KEY = "sk-or-v1-invalid",
       MUA_CONFIG_DIR = "test/functional/fixtures/nonexistent",
+      MUA_STATE_DIR = helpers.tmpdir(),
     })
     assert.equal(1, r.code)
     assert.truthy(r.stderr:match("api error"))
