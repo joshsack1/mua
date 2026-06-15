@@ -6,39 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 mua is a minimal coding agent — the feature class of [zot](https://github.com/patriceckhart/zot) and [pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent): an agent loop, four built-in tools (read/write/edit/bash), an LLM provider, persisted sessions — built in the style of [neovim](https://github.com/neovim/neovim): a C core embedding LuaJIT, with all configuration and extension done in Lua. The differentiator is the API surface: the exposed C API must feel immediately familiar to anyone who has spent serious time with neovim's `src/nvim/api/` or `vim.api`.
 
-**Current state: C infrastructure scaffolded.** The build system, base layer (memory/api types/loop/log/paths), minimal LuaJIT embed (init.lua evaluation; no `mua.api` bridge yet), bounded JSON wrapper over vendored cJSON, the chunk-split-invariant SSE decoder, the curl_multi⇄libuv HTTP client, and the OpenRouter streaming provider all exist: `mua -p "prompt"` streams a completion. The curl⇄libuv bridge is regression-tested end to end by a scriptable SSE fixture server (`test/functional/fixtures/sse_server.c` + `stream_spec.lua`: scripted byte slices, error envelopes, retry ladders over real sockets, no API key needed). Still to come: see the Roadmap below. Keep the Commands section in sync with what actually exists — never list a target here that doesn't run.
+**Current state: a working agent.** mua runs as an interactive line-based REPL or a one-shot `mua -p "prompt"`, streaming from OpenRouter (with bounded retries and streamed tool-call accumulation), executing the four built-in tools (`read`/`write`/`edit`/`bash`) behind a y/N approval gate on the mutating ones, and persisting every turn as append-only JSONL under `~/.local/state/mua/sessions/` with `--resume` to reload the latest. The whole stack is covered by 149 unit + 32 functional specs (the latter drive the binary against a scriptable SSE fixture server — `test/functional/fixtures/sse_server.c` — over real sockets, no API key needed) and runs clean under ASan/UBSan. **Still to come: the `mua.api` + Lua bridge** (Roadmap below) — `init.lua` is evaluated at startup but exposes no API yet, so user config and extension are still inert. Keep the Commands section in sync with what actually exists — never list a target here that doesn't run.
 
 ## Roadmap
 
-Planned order; nothing below exists yet:
+Next up (the agent milestone is done — see "Agent invariants" under Architecture):
 
-1. **Agent milestone** — sessions, tool calling, the four built-in tools, the agent loop, a line-based REPL. Spans many commits; tracked as its own section below.
-2. **`mua.api` + Lua bridge** — the identity feature, after the agent exists so it wraps settled behavior: `src/mua/api/{global,session,tools}.c` with `FUNC_API_SINCE` and table-driven dispatch, mechanical `mua.api.mua_*` registration, the autocmd event set, `mua_register_tool` from Lua, and the `mua.o`/`mua.g` sugar in `runtime/lua/mua/`.
+1. **`mua.api` + Lua bridge** — the identity feature, now that the agent exists for it to wrap: `src/mua/api/{global,session,tools}.c` with `FUNC_API_SINCE` and table-driven dispatch, mechanical `mua.api.mua_*` registration, the autocmd event set, `mua_register_tool` from Lua, and the `mua.o`/`mua.g` sugar in `runtime/lua/mua/`.
 
 Housekeeping, slotted whenever: CI running the full gauntlet (`make && make test && make lint` plus the `SANITIZE=1` suites); a LICENSE decision before the repo goes public (none exists yet, deliberately; Apache-2.0 would match neovim); a `MUA_HTTP_STALL_WINDOW_S` env override so stall detection becomes functionally testable against the fixture server; surface OpenRouter's `error.metadata.raw` in the provider's error message (`report_http_failure` in [openrouter.c](src/mua/provider/openrouter.c) prints only the top-level `error.message`, which is often a useless `"Provider returned error"` — the real upstream cause and the routing/provider detail live in `metadata.raw`, e.g. `"messages: at least one message is required"`; discarding it turned a one-line request-shape bug into a long diagnosis).
-
-## Agent milestone
-
-Turns mua from a streaming client into an agent. Too large for one context window — execute the commits below in order, one or a few per session, each green on the full gauntlet (`make && make test && make lint`, format-stable, no co-author trailers; run `make BUILD_DIR=build-san SANITIZE=1 test` after the tool/loop commits). **Full design: [docs/agent-milestone.md](docs/agent-milestone.md)** — read it before executing a commit; it carries the module surfaces, caps, wire-format reference, and per-commit test matrix. main.c is rewritten once, at commit 8 (commit 3 does a minimal migration so `-p` keeps working mid-milestone).
-
-- [x] 1. `feat(core): recursive ensure-dir in paths` — `paths_ensure_dir` (mkdir -p, 0700) + paths_spec
-- [x] 2. `feat(session): append-only jsonl session store` — session.{c,h}, CMake entry, move shared cJSON cdefs into test/unit/helpers.lua, session_spec
-- [x] 3. `feat(provider): tool calling with streamed tool_call accumulation` — openrouter v2 + seam changes + `start_attempt` full-reset fix + reject empty `messages` (`->child == NULL`) before `cJSON_CreateArrayReference`, which would silently build `"messages":[]` + minimal main.c migration + openrouter_spec (verify once against a live tool call via `op run`)
-- [x] 4. `feat(tools): registry, result contract, and the read tool` + tools_spec
-- [x] 5. `feat(tools): write and edit with exact-match replacement`
-- [x] 6. `feat(tools): bash via uv_spawn with mandatory timeout and bounded capture`
-- [x] 7. `feat(agent): turn loop with step cap, tool gate, and cancellation` — agent.{c,h} + `loop_run_nowait`; a mid-turn `session_append` failure finishes `kTurnFailed` and appends nothing further (the poison latch enforces this; the `--resume` repair heals the dangling file state)
-- [ ] 8. `feat(cli): line-based repl, sessions, --resume, and one-shot agent turns` — main.c rewrite + helpers `stdin=`/`MUA_STATE_DIR` + resume_spec + functional matrix; `--resume` semantics: no sessions → notice + fresh, but a corrupt latest fails hard naming file+line (the file is hand-repairable JSONL; a healed-over torn line is the realistic trigger — see session_spec — and silently starting fresh would hide the data loss); resume_spec covers both
-- [ ] 9. `docs: agent milestone state and commands` — tick this list, update Current state + README, retire the heading once all boxes are checked
-
-**Load-bearing contracts (do not re-litigate; the design depends on each):**
-
-1. Messages are wire-shaped `cJSON`; the session owns the conversation array; build request bodies zero-copy with `cJSON_CreateArrayReference(messages->child)` (the array's first element, not the array node — verified against vendored cJSON 1.7.18).
-2. `session_append(SessionState *, cJSON *msg, Error *)` takes ownership of `msg` unconditionally (frees even on failure); appended nodes stay borrowable until `session_free`.
-3. Provider `on_done(ud, cJSON *message, finish_reason, tokens)` transfers ownership of the assembled wire-shaped assistant message; the `messages`/`tools` opts are borrowed only for the `openrouter_stream` call.
-4. Tool failures are `ToolResult{is_error}`, never `Error *`; one async execute contract (sync tools fire `done` inline); the registry shape (name/description/schema/callback) is the seed of `mua_register_tool`.
-5. The agent gate is a single function-pointer chokepoint (the future Lua `ToolPre` hook wraps it); a dangling `tool_calls` message must always be answered with results (synthetic ones on refuse/cancel/resume) or every resumed request 400s.
-6. Tool-call detection: a nonempty `tool_calls` array is authoritative over the `finish_reason` string; the 50-step cap stops the turn, never loops.
 
 ## Hard rules
 
@@ -79,6 +55,17 @@ Dependencies are deliberately few: **LuaJIT** (Lua 5.1 fallback), **libuv** (eve
 Core runtime flow: startup evaluates `init.lua` → user submits a prompt → agent loop builds the request from the session, streams a response from the provider (OpenRouter's OpenAI-compatible Chat Completions API first, `OPENROUTER_API_KEY`; keep the provider interface thin enough to add others later), executes any tool calls, appends results to the session, repeats until the model stops or the **hard step cap** (default 50) is hit. Sessions persist as append-only JSONL, one message per line, under `~/.local/state/mua/sessions/` (pi-style). XDG throughout: config in `~/.config/mua`, state in `~/.local/state/mua`.
 
 Tools: the four built-ins (`read`, `write`, `edit` by exact-match replacement, `bash` with a mandatory timeout) are implemented in C. User-defined tools are registered from Lua via `mua.api.mua_register_tool` — the analog of `nvim_create_user_command`. Lifecycle hooks are autocmd-shaped: `mua.api.mua_create_autocmd("ToolPre", { callback = ... })` over a small fixed event set (`SessionStart`, `SessionEnd`, `ToolPre`, `ToolPost`, `StreamDelta`).
+
+### Agent invariants (settled — the API layer wraps these, never bypasses them)
+
+These held the agent milestone together and bind the `mua.api` bridge; the full design record is [docs/agent-milestone.md](docs/agent-milestone.md).
+
+1. Messages are wire-shaped `cJSON`; the session owns the conversation array; build request bodies zero-copy with `cJSON_CreateArrayReference(messages->child)` (the array's first element, not the array node — verified against vendored cJSON 1.7.18). Adding existing messages to a request array uses `cJSON_AddItemReferenceToArray`, never `cJSON_CreateObjectReference` (which nests the message under an empty key and drops its role).
+2. `session_append(SessionState *, cJSON *msg, Error *)` takes ownership of `msg` unconditionally (frees even on failure); appended nodes stay borrowable until `session_free`.
+3. Provider `on_done(ud, cJSON *message, finish_reason, tokens)` transfers ownership of the assembled wire-shaped assistant message; the `messages`/`tools` opts are borrowed only for the `openrouter_stream` call. The agent issues each request from a 0-ms timer, never inline from a provider callback (`curl_multi_add_handle` inside curl's own callback is `CURLM_RECURSIVE_API_CALL`).
+4. Tool failures are `ToolResult{is_error}`, never `Error *`; one async execute contract (sync tools fire `done` inline); the registry shape (name/description/schema/callback) is the seed of `mua_register_tool`.
+5. The agent gate is a single function-pointer chokepoint (the future Lua `ToolPre` hook wraps it); a dangling `tool_calls` message must always be answered with results (synthetic ones on refuse/cancel/resume) or every resumed request 400s.
+6. Tool-call detection: a nonempty `tool_calls` array is authoritative over the `finish_reason` string; the 50-step cap stops the turn, never loops.
 
 ## C API contract (the neovim part)
 

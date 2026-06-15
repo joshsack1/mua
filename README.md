@@ -3,9 +3,11 @@
 A minimal coding agent in the style of neovim: a C core embedding LuaJIT,
 configured and extended in Lua.
 
-**Status:** C infrastructure scaffolded — `mua -p "prompt"` streams a completion
-from OpenRouter; the agent loop, tools, sessions, and the `mua.api` surface are
-still to come. See [CLAUDE.md](CLAUDE.md) for the founding spec.
+**Status:** a working coding agent — an interactive REPL or a one-shot
+`mua -p`, four built-in tools (read/write/edit/bash) behind an approval gate,
+and resumable JSONL sessions, all streaming from OpenRouter. The Lua
+extension surface (`mua.api`) is still to come. See [CLAUDE.md](CLAUDE.md) for
+the founding spec.
 
 ## Building and testing
 
@@ -22,11 +24,27 @@ make SANITIZE=1 BUILD_DIR=build-san test   # the suites under ASan+UBSan
 
 ```sh
 export OPENROUTER_API_KEY=sk-or-...
-build/bin/mua -p "Reply with exactly: hello"
+
+build/bin/mua                       # interactive REPL ('exit' or Ctrl-D to quit)
+build/bin/mua -p "summarize README.md in one line"   # one-shot turn
+build/bin/mua --resume -p "now do the same for CLAUDE.md"  # continue the latest session
 ```
 
-Configuration is plain Lua at `~/.config/mua/init.lua` (override the location
-with `MUA_CONFIG_DIR`). The default model is `anthropic/claude-sonnet-4.6`;
+The model's reply streams to stdout; the prompt, tool trace, and notices go to
+stderr (so `mua -p … | tee out.txt` captures only the model). The model can
+call the built-in `read`/`write`/`edit`/`bash` tools; mutating tools prompt for
+`y/N` approval at the REPL. Flags:
+
+- `-p, --prompt TEXT` — run a single turn instead of the REPL (mutating tools
+  are auto-refused unless `--yes`).
+- `-y, --yes` — approve gated tool calls without prompting.
+- `-r, --resume` — reload the most recent session (none yet → notice, fresh start).
+- `-m, --model ID` — override the model for this run.
+
+Sessions are append-only JSONL under `~/.local/state/mua/sessions/`
+(`MUA_STATE_DIR` overrides). Configuration is plain Lua at
+`~/.config/mua/init.lua` (`MUA_CONFIG_DIR` overrides) — evaluated at startup,
+though it exposes no API yet. The default model is `anthropic/claude-sonnet-4.6`;
 `OPENROUTER_BASE_URL` overrides the API endpoint. `MUA_LOG=debug|info|warn|error`
 enables trace logging on stderr. Exit codes: 0 success, 1 runtime/API failure,
 64 usage error, 130 interrupted.

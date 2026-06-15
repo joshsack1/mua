@@ -1,12 +1,13 @@
 # Agent milestone — design
 
+**Status: delivered** (commits `d2d64df`..`f813774`). This file remains as the
+design record; the execution checklist that once tracked it has been retired,
+and its load-bearing contracts now live as "Agent invariants" under Architecture
+in [CLAUDE.md](../CLAUDE.md).
+
 The detailed design for turning mua from a streaming client into an agent
 (sessions, tool calling, the four built-in tools, the agent loop, a line-based
-REPL). The ordered commit checklist and the load-bearing contracts live in
-[CLAUDE.md](../CLAUDE.md) under "Agent milestone"; this file is the reference a
-session reads before executing one of those commits. It is too large to land in
-one context window — execute one or a few commits per session, ticking the
-CLAUDE.md checklist as you go, each green on `make && make test && make lint`.
+REPL).
 
 ## Decisions locked with the user
 
