@@ -23,22 +23,22 @@ static const double kExactIntMax = 9007199254740992.0; // 2^53
 static Object lua_to_object(lua_State *lstate, int idx)
 {
   switch (lua_type(lstate, idx)) {
-  case LUA_TSTRING: {
-    size_t len = 0;
-    const char *str = lua_tolstring(lstate, idx, &len);
-    return (Object){.type = kObjectTypeString, .data.string = {.data = (char *)str, .size = len}};
-  }
-  case LUA_TNUMBER: {
-    double num = (double)lua_tonumber(lstate, idx);
-    if (num >= -kExactIntMax && num <= kExactIntMax && num == (double)(Integer)num) {
-      return (Object){.type = kObjectTypeInteger, .data.integer = (Integer)num};
+    case LUA_TSTRING: {
+      size_t len = 0;
+      const char *str = lua_tolstring(lstate, idx, &len);
+      return (Object){.type = kObjectTypeString, .data.string = {.data = (char *)str, .size = len}};
     }
-    return (Object){.type = kObjectTypeFloat, .data.floating = num};
-  }
-  case LUA_TBOOLEAN:
-    return (Object){.type = kObjectTypeBoolean, .data.boolean = lua_toboolean(lstate, idx) != 0};
-  default:
-    return (Object){.type = kObjectTypeNil};
+    case LUA_TNUMBER: {
+      double num = (double)lua_tonumber(lstate, idx);
+      if (num >= -kExactIntMax && num <= kExactIntMax && num == (double)(Integer)num) {
+        return (Object){.type = kObjectTypeInteger, .data.integer = (Integer)num};
+      }
+      return (Object){.type = kObjectTypeFloat, .data.floating = num};
+    }
+    case LUA_TBOOLEAN:
+      return (Object){.type = kObjectTypeBoolean, .data.boolean = lua_toboolean(lstate, idx) != 0};
+    default:
+      return (Object){.type = kObjectTypeNil};
   }
 }
 
@@ -87,29 +87,29 @@ static int l_mua_get_option(lua_State *lstate)
     return 1;
   }
   switch (value.type) {
-  case kObjectTypeNil:
-    lua_pushnil(lstate);
-    break;
-  case kObjectTypeBoolean:
-    lua_pushboolean(lstate, value.data.boolean);
-    break;
-  case kObjectTypeInteger:
-    lua_pushinteger(lstate, (lua_Integer)value.data.integer);
-    break;
-  case kObjectTypeFloat:
-    lua_pushnumber(lstate, value.data.floating);
-    break;
-  default:
-    return luaL_error(lstate, "option '%s' has an unsupported value type", name);
+    case kObjectTypeNil:
+      lua_pushnil(lstate);
+      break;
+    case kObjectTypeBoolean:
+      lua_pushboolean(lstate, value.data.boolean);
+      break;
+    case kObjectTypeInteger:
+      lua_pushinteger(lstate, (lua_Integer)value.data.integer);
+      break;
+    case kObjectTypeFloat:
+      lua_pushnumber(lstate, value.data.floating);
+      break;
+    default:
+      return luaL_error(lstate, "option '%s' has an unsupported value type", name);
   }
   return 1;
 }
 
 // Registered mechanically; mua.api.mua_* mirrors the C names one-to-one.
 static const luaL_Reg api_functions[] = {
-    {"mua_set_option", l_mua_set_option},
-    {"mua_get_option", l_mua_get_option},
-    {NULL, NULL},
+  {"mua_set_option", l_mua_set_option},
+  {"mua_get_option", l_mua_get_option},
+  {NULL, NULL},
 };
 
 bool mua_lua_bridge_init(lua_State *lstate)

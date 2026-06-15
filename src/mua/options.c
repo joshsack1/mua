@@ -24,9 +24,9 @@ typedef struct {
 } OptionDef;
 
 static const OptionDef option_defs[] = {
-    {"system_prompt", kObjectTypeString, MUA_DEFAULT_SYSTEM_PROMPT, 0, 0, 0},
-    {"model", kObjectTypeString, NULL, 0, 0, 0},
-    {"step_cap", kObjectTypeInteger, NULL, MUA_STEP_CAP_MAX, MUA_STEP_CAP_MIN, MUA_STEP_CAP_MAX},
+  {"system_prompt", kObjectTypeString, MUA_DEFAULT_SYSTEM_PROMPT, 0, 0, 0},
+  {"model", kObjectTypeString, NULL, 0, 0, 0},
+  {"step_cap", kObjectTypeInteger, NULL, MUA_STEP_CAP_MAX, MUA_STEP_CAP_MIN, MUA_STEP_CAP_MAX},
 };
 
 enum { kOptionCount = (int)(sizeof option_defs / sizeof option_defs[0]) };
@@ -68,16 +68,16 @@ static Object clone_object(Object o)
 static const char *type_name(ObjectType type)
 {
   switch (type) {
-  case kObjectTypeString:
-    return "a string";
-  case kObjectTypeInteger:
-    return "an integer";
-  case kObjectTypeBoolean:
-    return "a boolean";
-  case kObjectTypeFloat:
-    return "a number";
-  default:
-    return "a value";
+    case kObjectTypeString:
+      return "a string";
+    case kObjectTypeInteger:
+      return "an integer";
+    case kObjectTypeBoolean:
+      return "a boolean";
+    case kObjectTypeFloat:
+      return "a number";
+    default:
+      return "a value";
   }
 }
 

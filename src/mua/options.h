@@ -29,7 +29,7 @@ Object options_get(String name, Error *err);
 // until the next options_set of that key or options_free.
 const char *options_system_prompt(void); // effective prompt; "" means omit, never NULL
 const char *options_model_borrow(void);  // set model, or NULL if unset (-> provider default)
-int options_step_cap(void);               // effective cap, always within [MIN, MAX]
+int options_step_cap(void);              // effective cap, always within [MIN, MAX]
 
 void options_free(void); // release all stored copies; reset to all-unset
 
