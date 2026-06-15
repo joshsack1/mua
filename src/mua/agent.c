@@ -10,19 +10,14 @@
 #include "mua/log.h"
 #include "mua/loop.h"
 #include "mua/memory.h"
+#include "mua/options.h"
 #include "mua/provider/openrouter.h"
 
 enum {
-  kAgentDefaultStepCap = 50,   // MUA_STEP_CAP clamps lower only
   kAgentArgsCap = 1024 * 1024, // parse bound for one call's arguments string
   kAgentGateLine = 64,
   kAgentGateDrainMax = 8192, // overlong gate input drained up to this many bytes
 };
-
-#define MUA_DEFAULT_SYSTEM_PROMPT                                                                  \
-  "You are mua, a minimal coding agent. Use the provided tools to read, "                          \
-  "write, and edit files and to run shell commands in the current working "                        \
-  "directory. Keep responses brief."
 
 struct AgentTurn {
   AgentOpts opts; // borrowed pointers within; the caller outlives the turn
@@ -68,31 +63,33 @@ static char *aformat(const char *fmt, ...)
   return msg;
 }
 
-// MUA_SYSTEM_PROMPT overrides the built-in default; empty omits it entirely.
-// Config, not dialogue: never persisted, injected at request build only.
+// Precedence env > init.lua (mua.o.system_prompt) > built-in default; an empty
+// string at either explicit layer omits the system message. Config, not
+// dialogue: never persisted, injected at request build only.
 static char *resolve_system_prompt(void)
 {
   const char *env = getenv("MUA_SYSTEM_PROMPT");
   if (env != NULL) {
     return env[0] != '\0' ? xstrdup(env) : NULL;
   }
-  return xstrdup(MUA_DEFAULT_SYSTEM_PROMPT);
+  const char *prompt = options_system_prompt(); // mua.o value if set, else the default
+  return prompt[0] != '\0' ? xstrdup(prompt) : NULL;
 }
 
-// MUA_STEP_CAP clamps lower only: a hostile environment cannot raise the
-// bound, and nonsense values fall back to the default.
+// Precedence env > init.lua (mua.o.step_cap) > built-in default. MUA_STEP_CAP
+// clamps lower only: a hostile environment cannot raise the bound, and a
+// present-but-nonsense value falls through to the lua/default layer.
 static int resolve_step_cap(void)
 {
   const char *env = getenv("MUA_STEP_CAP");
-  if (env == NULL || env[0] == '\0') {
-    return kAgentDefaultStepCap;
+  if (env != NULL && env[0] != '\0') {
+    char *end = NULL;
+    long value = strtol(env, &end, 10);
+    if (end != env && *end == '\0' && value >= MUA_STEP_CAP_MIN && value <= MUA_STEP_CAP_MAX) {
+      return (int)value;
+    }
   }
-  char *end = NULL;
-  long value = strtol(env, &end, 10);
-  if (end == env || *end != '\0' || value < 1 || value > kAgentDefaultStepCap) {
-    return kAgentDefaultStepCap;
-  }
-  return (int)value;
+  return options_step_cap(); // mua.o value if set, else the built-in default; in range
 }
 
 // Frees the turn once its step_timer has closed (libuv needs the handle

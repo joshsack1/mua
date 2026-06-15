@@ -15,6 +15,7 @@
 #include "mua/loop.h"
 #include "mua/lua/state.h"
 #include "mua/memory.h"
+#include "mua/options.h"
 #include "mua/session.h"
 
 enum {
@@ -273,12 +274,17 @@ static int run_agent(const MuaArgs *args)
   if (sess == NULL) {
     (void)fprintf(stderr, "mua: %s\n", err.msg != NULL ? err.msg : "cannot open session");
     api_clear_error(&err);
-  } else if (args->prompt != NULL) {
-    AgentGateFn gate = args->yes ? agent_gate_approve_all : agent_gate_auto_refuse;
-    bool hard_stop = false;
-    code = run_one_turn(http, sess, gate, args->model, api_key, args->prompt, &hard_stop);
   } else {
-    code = run_repl(http, sess, args->model, api_key, args->yes);
+    // Effective model: CLI -m wins, else mua.o.model from init.lua, else NULL
+    // (the provider default). The store outlives the turn, so borrowing is safe.
+    const char *model = args->model != NULL ? args->model : options_model_borrow();
+    if (args->prompt != NULL) {
+      AgentGateFn gate = args->yes ? agent_gate_approve_all : agent_gate_auto_refuse;
+      bool hard_stop = false;
+      code = run_one_turn(http, sess, gate, model, api_key, args->prompt, &hard_stop);
+    } else {
+      code = run_repl(http, sess, model, api_key, args->yes);
+    }
   }
   session_free(sess); // NULL-safe; the turn borrowed it and is finished
   http_client_close(http);
@@ -309,6 +315,7 @@ static int run(const MuaArgs *args)
     }
   }
   mua_lua_teardown();
+  options_free(); // release option copies set from init.lua
   if (!loop_close() && code == kExitOk) {
     code = kExitFailure;
   }
