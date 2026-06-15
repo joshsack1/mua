@@ -2,24 +2,10 @@ local t = require("test.unit.helpers")
 local ffi = t.ffi
 local lib = t.lib
 
--- Object/ObjectType mirror src/mua/api/private/defs.h (String/Error come from
--- the shared helpers cdef). The store is a process-global singleton and busted
--- runs one process, so every case resets it via options_free in before_each.
+-- The Object vocabulary, like String/Error, comes from the shared helpers cdef.
+-- The store is a process-global singleton and busted runs one process, so every
+-- case resets it via options_free in before_each.
 t.cdef([[
-  typedef enum {
-    kObjectTypeNil = 0, kObjectTypeBoolean, kObjectTypeInteger, kObjectTypeFloat,
-    kObjectTypeString, kObjectTypeArray, kObjectTypeDict, kObjectTypeSession
-  } ObjectType;
-  typedef struct object Object;
-  typedef struct key_value_pair KeyValuePair;
-  typedef struct { Object *items; size_t size; size_t capacity; } Array;
-  typedef struct { KeyValuePair *items; size_t size; size_t capacity; } Dict;
-  struct object {
-    ObjectType type;
-    union { bool boolean; int64_t integer; double floating; String string; Array array; Dict dict; } data;
-  };
-  struct key_value_pair { String key; Object value; };
-
   void api_free_string(String str);
   void options_set(String name, Object value, Error *err);
   Object options_get(String name, Error *err);

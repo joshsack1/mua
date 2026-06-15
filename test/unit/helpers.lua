@@ -21,6 +21,20 @@ ffi.cdef([[
   void xfree(void *ptr);
   void api_clear_error(Error *err);
 
+  typedef enum {
+    kObjectTypeNil = 0, kObjectTypeBoolean, kObjectTypeInteger, kObjectTypeFloat,
+    kObjectTypeString, kObjectTypeArray, kObjectTypeDict, kObjectTypeSession
+  } ObjectType;
+  typedef struct object Object;
+  typedef struct key_value_pair KeyValuePair;
+  typedef struct { Object *items; size_t size; size_t capacity; } Array;
+  typedef struct { KeyValuePair *items; size_t size; size_t capacity; } Dict;
+  struct object {
+    ObjectType type;
+    union { bool boolean; int64_t integer; double floating; String string; Array array; Dict dict; } data;
+  };
+  struct key_value_pair { String key; Object value; };
+
   typedef struct cJSON cJSON;
   void json_init(void);
   cJSON *json_parse(String doc, size_t max_size, Error *err);

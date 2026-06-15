@@ -22,4 +22,25 @@ void api_free_string(String str);
 #define ARRAY_OBJ(a) ((Object){.type = kObjectTypeArray, .data.array = (a)})
 #define DICT_OBJ(d) ((Object){.type = kObjectTypeDict, .data.dict = (d)})
 
+// Maximum Object nesting depth. Bounds the explicit-stack walks below (and,
+// later, Lua<->Object marshaling) so no walk recurses over input-shaped depth,
+// per json.h's tree-walk rule. Config/variable data is shallow; producers
+// reject deeper input, so a tree exceeding this cannot reach the walks -- the
+// bound is a can't-happen invariant there (asserted), not an input check.
+enum { kMarshalDepthCap = 32 };
+
+// Deep-copies `s` into a fresh allocation that keeps a trailing NUL (size
+// excludes it; embedded NULs are preserved). NULL data -> STRING_INIT.
+String api_string_dup(String s);
+
+// Returns a fully owned deep copy of `*src`: scalars by value, String
+// duplicated, Array/Dict given fresh backing storage copied element by element.
+// Iterative (bounded explicit stack), never recursive. NULL src -> Nil.
+Object api_copy_object(const Object *src);
+
+// Frees every heap allocation owned by `*obj` -- String data, nested Array/Dict
+// backing arrays, and Dict keys -- then resets it to Nil. Iterative; NULL-safe
+// and idempotent on a Nil/zeroed Object. Not for arena-allocated trees.
+void api_free_object(Object *obj);
+
 #endif // MUA_API_PRIVATE_HELPERS_H
