@@ -9,6 +9,7 @@
 #include <lua.h>
 #include <lualib.h>
 
+#include "mua/lua/bridge.h"
 #include "mua/memory.h"
 #include "mua/paths.h"
 
@@ -42,6 +43,10 @@ bool mua_lua_init(void)
   }
   prepend_runtime_path(lstate, runtime_dir);
   xfree(runtime_dir);
+  if (!mua_lua_bridge_init(lstate)) {
+    lua_close(lstate);
+    return false;
+  }
   g_lua = lstate;
   return true;
 }

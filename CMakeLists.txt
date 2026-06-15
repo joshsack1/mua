@@ -44,6 +44,7 @@ set(MUA_SOURCES
     src/mua/json.c
     src/mua/log.c
     src/mua/loop.c
+    src/mua/lua/bridge.c
     src/mua/lua/state.c
     src/mua/memory.c
     src/mua/options.c
