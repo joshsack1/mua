@@ -4,7 +4,6 @@
 #include <string.h>
 
 #include "mua/api/private/helpers.h"
-#include "mua/memory.h"
 
 // The built-in system prompt: the default when neither env nor init.lua sets
 // one. Lives here (not the agent) so it is the option table's declared default
@@ -44,27 +43,6 @@ typedef struct {
 // compile-time option, never grows.
 static OptionSlot g_options[kOptionCount];
 
-// A NUL-terminated deep copy: keeps the length (the API round-trip may carry
-// embedded NULs) and a trailing NUL (the agent uses these as C strings).
-static String string_dup(String s)
-{
-  if (s.data == NULL) {
-    return STRING_INIT;
-  }
-  char *buf = xmalloc(s.size + 1);
-  memcpy(buf, s.data, s.size);
-  buf[s.size] = '\0';
-  return (String){.data = buf, .size = s.size};
-}
-
-static Object clone_object(Object o)
-{
-  if (o.type == kObjectTypeString) {
-    return (Object){.type = kObjectTypeString, .data.string = string_dup(o.data.string)};
-  }
-  return o; // scalar / Nil: a by-value copy is a full copy
-}
-
 static const char *type_name(ObjectType type)
 {
   switch (type) {
@@ -94,11 +72,8 @@ static int option_index(String name)
 
 static void clear_slot(int idx)
 {
-  if (g_options[idx].is_set && g_options[idx].value.type == kObjectTypeString) {
-    api_free_string(g_options[idx].value.data.string);
-  }
+  api_free_object(&g_options[idx].value); // frees any owned value; resets to Nil
   g_options[idx].is_set = false;
-  g_options[idx].value = (Object){.type = kObjectTypeNil};
 }
 
 static Object default_object(const OptionDef *def)
@@ -133,7 +108,7 @@ void options_set(String name, Object value, Error *err)
     return;
   }
   clear_slot(idx); // free any prior value before overwriting
-  g_options[idx].value = clone_object(value);
+  g_options[idx].value = api_copy_object(&value);
   g_options[idx].is_set = true;
 }
 
@@ -146,7 +121,7 @@ Object options_get(String name, Error *err)
     return (Object){.type = kObjectTypeNil};
   }
   if (g_options[idx].is_set) {
-    return clone_object(g_options[idx].value);
+    return api_copy_object(&g_options[idx].value);
   }
   return default_object(&option_defs[idx]);
 }
