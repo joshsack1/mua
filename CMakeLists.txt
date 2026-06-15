@@ -52,7 +52,8 @@ set(MUA_SOURCES
     src/mua/provider/openrouter.c
     src/mua/session.c
     src/mua/sse.c
-    src/mua/tools.c)
+    src/mua/tools.c
+    src/mua/variables.c)
 
 add_library(mua_obj OBJECT ${MUA_SOURCES})
 set_target_properties(mua_obj PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET
