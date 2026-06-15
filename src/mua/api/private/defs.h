@@ -7,6 +7,14 @@
 
 // API type vocabulary, mirroring nvim's src/nvim/api/private/defs.h.
 
+// Marks the API level a function first appeared in (the API is append-only:
+// deprecate, never repurpose). A compile-time no-op today -- a future dispatch
+// generator reads it -- written after the parameter list, like nvim's
+// FUNC_API_SINCE.
+#ifndef FUNC_API_SINCE
+#define FUNC_API_SINCE(x)
+#endif
+
 typedef int32_t handle_T;
 typedef handle_T Session; // 0 means "current session", as 0 means current buffer in nvim
 
