@@ -43,11 +43,21 @@ call the built-in `read`/`write`/`edit`/`bash` tools; mutating tools prompt for
 
 Sessions are append-only JSONL under `~/.local/state/mua/sessions/`
 (`MUA_STATE_DIR` overrides). Configuration is plain Lua at
-`~/.config/mua/init.lua` (`MUA_CONFIG_DIR` overrides) — evaluated at startup,
-though it exposes no API yet. The default model is `anthropic/claude-sonnet-4.6`;
-`OPENROUTER_BASE_URL` overrides the API endpoint. `MUA_LOG=debug|info|warn|error`
-enables trace logging on stderr. Exit codes: 0 success, 1 runtime/API failure,
-64 usage error, 130 interrupted.
+`~/.config/mua/init.lua` (`MUA_CONFIG_DIR` overrides), evaluated at startup. It
+can set agent options through `mua.o`, the neovim `vim.o`-style proxy:
+
+```lua
+-- ~/.config/mua/init.lua
+mua.o.system_prompt = "You are a terse Rust reviewer." -- "" omits the system message
+mua.o.model = "z-ai/glm-5.1"
+mua.o.step_cap = 30
+```
+
+Precedence is environment variable (where one exists) > `init.lua` > built-in
+default; for `model`, the `-m` flag wins over `init.lua`. The default model is
+`anthropic/claude-sonnet-4.6`; `OPENROUTER_BASE_URL` overrides the API endpoint.
+`MUA_LOG=debug|info|warn|error` enables trace logging on stderr. Exit codes: 0
+success, 1 runtime/API failure, 64 usage error, 130 interrupted.
 
 ## Bootstrap (macOS)
 
