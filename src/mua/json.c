@@ -156,3 +156,180 @@ void json_free(cJSON *node)
 {
   cJSON_Delete(node);
 }
+
+// --- cJSON <-> Object marshaling (the boundary-rule converter) ----------------
+// Iterative, depth-capped walks paralleling api_copy_object in helpers.c: one
+// builds a heap Object tree from cJSON, the other the reverse. cJSON keys and
+// string values are NUL-terminated C strings, so cstr_to_string is exact -- the
+// only place an embedded NUL could be lost is object_to_cjson's String edge,
+// which cannot reach a NUL-terminated cJSON string anyway.
+
+static size_t cjson_child_count(const cJSON *node)
+{
+  size_t n = 0;
+  for (const cJSON *c = node->child; c != NULL; c = c->next) {
+    n++;
+  }
+  return n;
+}
+
+// Shallow-initializes `*dst` from cJSON `*src`: a scalar/null by value, a String
+// copied, an Array/Dict typed with a freshly allocated (zeroed, hence Nil-filled)
+// backing array. A Dict's keys are filled here; all container element values are
+// left Nil for the walk to fill. Allocation aborts on OOM, so this cannot fail.
+static void cjson_node_init(const cJSON *src, Object *dst)
+{
+  if (cJSON_IsString(src)) {
+    *dst = STRING_OBJ(cstr_to_string(src->valuestring));
+  } else if (cJSON_IsNumber(src)) {
+    double num = src->valuedouble;
+    if (num >= -MUA_EXACT_INT_MAX && num <= MUA_EXACT_INT_MAX && num == (double)(Integer)num) {
+      *dst = INTEGER_OBJ((Integer)num);
+    } else {
+      *dst = FLOAT_OBJ(num);
+    }
+  } else if (cJSON_IsBool(src)) {
+    *dst = BOOLEAN_OBJ(cJSON_IsTrue(src));
+  } else if (cJSON_IsArray(src)) {
+    size_t n = cjson_child_count(src);
+    dst->type = kObjectTypeArray;
+    dst->data.array.size = n;
+    dst->data.array.capacity = n;
+    dst->data.array.items = (n > 0) ? xcalloc(n, sizeof(Object)) : NULL; // zeroed -> Nil
+  } else if (cJSON_IsObject(src)) {
+    size_t n = cjson_child_count(src);
+    KeyValuePair *items = (n > 0) ? xcalloc(n, sizeof(KeyValuePair)) : NULL;
+    dst->type = kObjectTypeDict;
+    dst->data.dict.size = n;
+    dst->data.dict.capacity = n;
+    dst->data.dict.items = items;
+    if (items != NULL) { // n == 0 has no children to walk; guard makes that provable
+      size_t i = 0;
+      for (const cJSON *c = src->child; c != NULL; c = c->next) {
+        items[i++].key = cstr_to_string(c->string); // value stays Nil for the walk
+      }
+    }
+  } else {
+    *dst = NIL; // cJSON null, or an unexpected type from a non-parser source
+  }
+}
+
+typedef struct {
+  const cJSON *src; // source container
+  Object *dst;      // its fresh copy: backing allocated, values pending
+  const cJSON *cur; // next child node to consume (parallels dst's index)
+  size_t i;         // next child index to fill
+} CjsonFrame;
+
+bool cjson_to_object(const cJSON *node, Object *out, Error *err)
+{
+  Object root;
+  cjson_node_init(node, &root);
+  if (root.type != kObjectTypeArray && root.type != kObjectTypeDict) {
+    *out = root; // scalar / String / Nil: fully built, no children to walk
+    return true;
+  }
+  CjsonFrame stack[kMarshalDepthCap];
+  int depth = 0;
+  stack[depth++] = (CjsonFrame){.src = node, .dst = &root, .cur = node->child, .i = 0};
+  while (depth > 0) {
+    CjsonFrame *f = &stack[depth - 1];
+    bool is_array = f->dst->type == kObjectTypeArray;
+    size_t n = is_array ? f->dst->data.array.size : f->dst->data.dict.size;
+    if (f->i >= n) {
+      depth--;
+      continue;
+    }
+    const cJSON *cs = f->cur;
+    assert(cs != NULL); // cjson_node_init set dst's size from this same child chain
+    Object *slot =
+      is_array ? &f->dst->data.array.items[f->i] : &f->dst->data.dict.items[f->i].value;
+    f->i++;
+    f->cur = cs->next;
+    // Reject (before allocating it) a container that would sit past the cap, so
+    // the partial tree stays <= cap deep and api_free_object can unwind it.
+    if ((cJSON_IsArray(cs) || cJSON_IsObject(cs)) && depth >= kMarshalDepthCap) {
+      api_set_error(err, kErrorTypeValidation, "json nesting exceeds %d", kMarshalDepthCap);
+      api_free_object(&root);
+      return false;
+    }
+    cjson_node_init(cs, slot);
+    if (slot->type == kObjectTypeArray || slot->type == kObjectTypeDict) {
+      stack[depth++] = (CjsonFrame){.src = cs, .dst = slot, .cur = cs->child, .i = 0};
+    }
+  }
+  *out = root;
+  return true;
+}
+
+// Builds a leaf cJSON for a scalar/Nil, or an empty container the walk fills.
+static cJSON *object_make_node(const Object *o)
+{
+  switch (o->type) {
+    case kObjectTypeBoolean:
+      return cJSON_CreateBool(o->data.boolean);
+    case kObjectTypeInteger:
+      return cJSON_CreateNumber((double)o->data.integer);
+    case kObjectTypeFloat:
+      return cJSON_CreateNumber(o->data.floating);
+    case kObjectTypeString: {
+      char *tmp = xstrndup(o->data.string.data != NULL ? o->data.string.data : "",
+                           o->data.string.size);
+      cJSON *str = cJSON_CreateString(tmp);
+      xfree(tmp);
+      return str;
+    }
+    case kObjectTypeArray:
+      return cJSON_CreateArray();
+    case kObjectTypeDict:
+      return cJSON_CreateObject();
+    default:
+      return cJSON_CreateNull(); // Nil, Session, or unexpected
+  }
+}
+
+typedef struct {
+  const Object *src; // source Array/Dict
+  cJSON *dst;        // its cJSON container being filled
+  size_t i;          // next child index to emit
+} ObjFrame;
+
+cJSON *object_to_cjson(const Object *obj)
+{
+  if (obj == NULL) {
+    return cJSON_CreateNull();
+  }
+  cJSON *root = object_make_node(obj);
+  if (obj->type != kObjectTypeArray && obj->type != kObjectTypeDict) {
+    return root; // scalar / String / Nil
+  }
+  ObjFrame stack[kMarshalDepthCap];
+  int depth = 0;
+  stack[depth++] = (ObjFrame){.src = obj, .dst = root, .i = 0};
+  while (depth > 0) {
+    ObjFrame *f = &stack[depth - 1];
+    bool is_array = f->src->type == kObjectTypeArray;
+    size_t n = is_array ? f->src->data.array.size : f->src->data.dict.size;
+    if (f->i >= n) {
+      depth--;
+      continue;
+    }
+    size_t idx = f->i++;
+    const Object *csrc =
+      is_array ? &f->src->data.array.items[idx] : &f->src->data.dict.items[idx].value;
+    cJSON *child = object_make_node(csrc);
+    if (is_array) {
+      cJSON_AddItemToArray(f->dst, child);
+    } else {
+      String key = f->src->data.dict.items[idx].key;
+      char *kz = xstrndup(key.data != NULL ? key.data : "", key.size);
+      cJSON_AddItemToObject(f->dst, kz, child); // copies the key; free our temp
+      xfree(kz);
+    }
+    if (csrc->type == kObjectTypeArray || csrc->type == kObjectTypeDict) {
+      assert(depth < kMarshalDepthCap); // producers cap depth; deeper cannot occur
+      stack[depth++] = (ObjFrame){.src = csrc, .dst = child, .i = 0};
+    }
+  }
+  return root;
+}

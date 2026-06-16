@@ -14,10 +14,6 @@
 // option storage lives in C; this layer only marshals values across and
 // translates API errors into Lua errors.
 
-// Doubles represent every integer exactly up to 2^53; beyond that, treat a Lua
-// number as a float rather than risk an out-of-range double->int64 conversion.
-static const double kExactIntMax = 9007199254740992.0; // 2^53
-
 // Marshal a Lua value (string / number / boolean / nil only) to an Object. The
 // string case borrows Lua's buffer -- options_set copies it before the value
 // leaves the stack. Length-prefixed: String is not NUL-terminated and a value
@@ -32,7 +28,7 @@ static Object lua_to_object(lua_State *lstate, int idx)
     }
     case LUA_TNUMBER: {
       double num = (double)lua_tonumber(lstate, idx);
-      if (num >= -kExactIntMax && num <= kExactIntMax && num == (double)(Integer)num) {
+      if (num >= -MUA_EXACT_INT_MAX && num <= MUA_EXACT_INT_MAX && num == (double)(Integer)num) {
         return (Object){.type = kObjectTypeInteger, .data.integer = (Integer)num};
       }
       return (Object){.type = kObjectTypeFloat, .data.floating = num};
@@ -122,7 +118,7 @@ static Object scalarize(lua_State *lstate, int idx, Arena *arena)
       return BOOLEAN_OBJ(lua_toboolean(lstate, idx) != 0);
     case LUA_TNUMBER: {
       double num = (double)lua_tonumber(lstate, idx);
-      if (num >= -kExactIntMax && num <= kExactIntMax && num == (double)(Integer)num) {
+      if (num >= -MUA_EXACT_INT_MAX && num <= MUA_EXACT_INT_MAX && num == (double)(Integer)num) {
         return INTEGER_OBJ((Integer)num);
       }
       return FLOAT_OBJ(num);

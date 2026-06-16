@@ -48,4 +48,22 @@ cJSON *json_add_arr(cJSON *obj, const char *key);
 String json_print(const cJSON *node); // unformatted; caller xfrees .data
 void json_free(cJSON *node);          // NULL-safe
 
+// cJSON <-> Object: the one place wire JSON crosses into the API type system
+// (the boundary rule above). Both walk an explicit stack capped at
+// kMarshalDepthCap -- the Object/Lua cap, below cJSON's own depth-64 limit -- so
+// input nested past the cap is rejected, never recursed. This keeps the Lua
+// bridge cJSON-free: it marshals Object<->Lua, these marshal cJSON<->Object.
+
+// Builds a heap-owned Object from `node` (free via api_free_object). cJSON
+// object -> Dict, array -> Array, null -> Nil; a number splits to Integer or
+// Float by the 2^53 exactness rule. Sets a Validation error and returns false
+// (leaving `*out` untouched) when nesting exceeds the cap. `node` is borrowed.
+bool cjson_to_object(const cJSON *node, Object *out, Error *err);
+
+// Builds a fresh owned cJSON tree from `obj` (free via json_free). Nil -> null;
+// String copied as a C string (an embedded NUL truncates, as elsewhere on the
+// cJSON edge). `obj` is borrowed and must not nest past the cap -- its producers
+// (cjson_to_object, lua_pop_object) already enforce it, so depth is asserted.
+cJSON *object_to_cjson(const Object *obj);
+
 #endif // MUA_JSON_H

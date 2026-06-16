@@ -29,6 +29,12 @@ void api_free_string(String str);
 // bound is a can't-happen invariant there (asserted), not an input check.
 enum { kMarshalDepthCap = 32 };
 
+// Doubles represent every integer exactly up to 2^53; a number beyond that is
+// kept as a Float rather than risk a lossy double<->int64 round-trip. Shared by
+// every number-marshaling site (Lua<->Object in bridge.c, cJSON<->Object in
+// json.c) so the int/float split stays identical across them.
+#define MUA_EXACT_INT_MAX 9007199254740992.0 // 2^53
+
 // Deep-copies `s` into a fresh allocation that keeps a trailing NUL (size
 // excludes it; embedded NULs are preserved). NULL data -> STRING_INIT.
 String api_string_dup(String s);
