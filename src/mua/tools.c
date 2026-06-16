@@ -954,8 +954,10 @@ static const ToolDef tool_defs[] = {
 
 // Tools registered from Lua (mua_register_tool): a flat capped array beside the
 // static built-ins -- tools_lookup and tools_build_openai_array scan both.
-// Bounded like every accumulator (code-safety). Mutable singleton; tools_teardown
-// frees it before the Lua state goes away.
+// Bounded like every accumulator (code-safety). Documented mutable singleton #7
+// (after the event loop, the Lua state, the options store, the variables store,
+// the autocmd registry, and the current-session pointer); tools_teardown frees
+// it before the Lua state goes away.
 enum { kMaxRegisteredTools = 256 };
 static ToolDef g_registered[kMaxRegisteredTools];
 static size_t g_registered_count;
