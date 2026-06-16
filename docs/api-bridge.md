@@ -5,9 +5,10 @@
 `FUNC_API_SINCE(1)`, the table-driven `mua.api.mua_*` registration in
 [bridge.c](../src/mua/lua/bridge.c), the C options store in [options.c](../src/mua/options.c),
 and the `mua.o` sugar in [runtime/lua/mua/init.lua](../runtime/lua/mua/init.lua));
-**Step 1** — Lua↔Object value marshaling and `mua.g`; and **Step 2** — `mua_register_tool`,
-user-defined tools from Lua, with the `cjson_to_object`/`object_to_cjson` converter that the
-remaining steps reuse. This file is the design record for the milestone — the sequence that takes
+**Step 1** — Lua↔Object value marshaling and `mua.g`; **Step 2** — `mua_register_tool`,
+user-defined tools from Lua, with the `cjson_to_object`/`object_to_cjson` converter the later
+steps reuse; and **Step 3** — the autocmd event set, dispatched from main.c at the agent's
+existing callback seams. This file is the design record for the milestone — the sequence that takes
 `mua.api` from "options only" to the full neovim-style surface (user tools, autocmd hooks, session
 scope, and an `--embed` RPC frontend).
 
@@ -158,7 +159,30 @@ The original design follows.
 useful once user tools exist, and because it forces the cJSON↔Lua args marshaling that Step 3's
 `ToolPre`/`ToolPost` payloads reuse.)*
 
-### Step 3 — Autocmd event set
+### Step 3 — Autocmd event set — ✅ Landed
+
+**Landed** (`b76a18f`, `b8138eb`, `70c00af`). What shipped, and where it deviated from the design
+recorded below:
+
+- **`ToolPre` fires for *every* tool, not only mutating ones.** Resolved with the user: instead of
+  wrapping the mutating-only gate, the gate is now consulted for every tool (the `start_tool` guard
+  relaxed to `if (turn->cb.gate != NULL)`) and the mutating-only human y/N moved *into* the policies
+  (`agent_gate_auto_refuse`/`agent_gate_interactive` approve non-mutating tools up front).
+  Behavior-preserving — the existing gate tests pin it — and now `ToolPre` observes/vetoes reads too.
+- **All five events dispatch from main.c**, not agent.c — the settled agent loop gains no
+  Lua/autocmd knowledge. `ToolPre` rides a composing gate (`gate_with_autocmds`) wrapping the chosen
+  policy (`TurnCtx.base_gate`); `StreamDelta`←`on_text`, `ToolPost`←`on_tool_result`,
+  `SessionStart`/`SessionEnd`←`run_agent`. cJSON stays out of the bridge: main.c marshals the
+  `ToolPre` args cJSON→Object, the seam takes Object→Lua.
+- **Store is core** ([autocmd.c](../src/mua/autocmd.c), singleton #5, `{id, event, LuaRef}`); the
+  four dispatch seams live in the bridge (reuse the static `object_to_lua`). `mua_lua_tool_unref`
+  generalized to a shared `mua_lua_unref` ([lua/ref.h](../src/mua/lua/ref.h)). **Veto convention**:
+  a hook returns `false` (generic) or a string reason; a throw is caught (nonfatal), not a veto.
+- The callback receives one table `{ event, ... }`; raw `mua_create_autocmd(event, callback)` is 1:1
+  with C, and `mua.create_autocmd(event, {callback=})` is the nvim-shaped sugar.
+
+The original design follows (note: `ToolPre` ended up at the composing gate for *all* tools, not the
+mutating-only chokepoint, and `on_tool_start` was not used).
 
 - **Goal**: `mua.api.mua_create_autocmd("ToolPre", {callback = ...})` over the fixed event set
   `SessionStart`/`SessionEnd`/`ToolPre`/`ToolPost`/`StreamDelta` — invariant #5 realized.
