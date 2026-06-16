@@ -17,6 +17,7 @@
 #include "mua/memory.h"
 #include "mua/options.h"
 #include "mua/session.h"
+#include "mua/tools.h"
 
 enum {
   kExitOk = 0,
@@ -314,6 +315,7 @@ static int run(const MuaArgs *args)
       code = run_agent(args);
     }
   }
+  tools_teardown();  // unref Lua tool callbacks while the state is still alive
   mua_lua_teardown();
   options_free(); // release option copies set from init.lua
   if (!loop_close() && code == kExitOk) {

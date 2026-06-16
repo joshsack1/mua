@@ -8,13 +8,16 @@ t.cdef([[
   typedef struct { char *content; bool is_error; } ToolResult;
   typedef struct ToolExec ToolExec;
   typedef void (*ToolDoneCb)(void *ud, const ToolResult *result);
-  typedef struct {
+  typedef struct ToolDef ToolDef;
+  struct ToolDef {
     const char *name;
     const char *description;
     const char *params_schema;
+    cJSON *schema_json;
+    ToolExec *(*execute)(const ToolDef *def, cJSON *args, ToolDoneCb done, void *ud);
     bool mutating;
-    ToolExec *(*execute)(cJSON *args, ToolDoneCb done, void *ud);
-  } ToolDef;
+    int callback;
+  };
   const ToolDef *tools_lookup(const char *name);
   cJSON *tools_build_openai_array(Error *err);
   void tools_cancel(ToolExec *exec);
@@ -65,7 +68,7 @@ local function run_tool(def, args_json)
     }
     lib.xfree(result.content) -- ownership of content transfers to the callee
   end)
-  local exec = def.execute(args, cb, nil)
+  local exec = def.execute(def, args, cb, nil)
   cb:free()
   lib.json_free(args)
   assert.is_true(exec == nil) -- sync contract: done fired inline
@@ -444,7 +447,7 @@ describe("bash tool", function()
       }
       lib.xfree(result.content)
     end)
-    local exec = def.execute(args, cb, nil)
+    local exec = def.execute(def, args, cb, nil)
     lib.json_free(args) -- borrowed only for the call; uv_spawn copied argv
     local async = exec ~= nil
     if async then
@@ -539,7 +542,7 @@ describe("bash tool", function()
       captured = { content = ffi.string(result.content), is_error = result.is_error }
       lib.xfree(result.content)
     end)
-    local exec = def.execute(args, cb, nil)
+    local exec = def.execute(def, args, cb, nil)
     lib.json_free(args)
     assert.is_true(exec ~= nil)
     lib.tools_cancel(exec)

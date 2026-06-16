@@ -18,6 +18,11 @@
 typedef int32_t handle_T;
 typedef handle_T Session; // 0 means "current session", as 0 means current buffer in nvim
 
+// A Lua function held in the registry via luaL_ref (nvim's LuaRef). Lua-only --
+// a callback cannot be marshaled to an Object or over RPC, so it travels as its
+// own parameter type, never an Object variant.
+typedef int LuaRef;
+
 typedef struct {
   char *data; // never assume NUL-termination
   size_t size;

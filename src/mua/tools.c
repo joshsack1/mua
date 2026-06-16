@@ -17,6 +17,7 @@
 #include "mua/json.h"
 #include "mua/log.h"
 #include "mua/loop.h"
+#include "mua/lua/tool.h"
 #include "mua/memory.h"
 #include "mua/paths.h"
 
@@ -221,8 +222,9 @@ static char *read_assemble_content(const ReadScan *scan, ReadStatus status)
   return content;
 }
 
-static ToolExec *read_execute(cJSON *args, ToolDoneCb done, void *ud)
+static ToolExec *read_execute(const ToolDef *def, cJSON *args, ToolDoneCb done, void *ud)
 {
+  (void)def; // built-ins are dispatched by name; only dynamic tools read `def`
   const char *path = json_get_cstr(args, "path");
   if (path == NULL || path[0] == '\0') {
     fail(done, ud, "read: path is required");
@@ -295,8 +297,9 @@ static bool write_all(int fd, const char *data, size_t len, int *io_errno)
   return true;
 }
 
-static ToolExec *write_execute(cJSON *args, ToolDoneCb done, void *ud)
+static ToolExec *write_execute(const ToolDef *def, cJSON *args, ToolDoneCb done, void *ud)
 {
+  (void)def;
   const char *path = json_get_cstr(args, "path");
   if (path == NULL || path[0] == '\0') {
     fail(done, ud, "write: path is required");
@@ -456,8 +459,9 @@ static bool edit_rewrite(int fd, const char *path, const char *data, size_t len,
   return true;
 }
 
-static ToolExec *edit_execute(cJSON *args, ToolDoneCb done, void *ud)
+static ToolExec *edit_execute(const ToolDef *def, cJSON *args, ToolDoneCb done, void *ud)
 {
+  (void)def;
   const char *path = json_get_cstr(args, "path");
   if (path == NULL || path[0] == '\0') {
     fail(done, ud, "edit: path is required");
@@ -800,8 +804,9 @@ static bool bash_make_pipe(int fds[2], ToolDoneCb done, void *ud)
   return true;
 }
 
-static ToolExec *bash_execute(cJSON *args, ToolDoneCb done, void *ud)
+static ToolExec *bash_execute(const ToolDef *def, cJSON *args, ToolDoneCb done, void *ud)
 {
+  (void)def;
   const char *command = NULL;
   int64_t timeout_ms = 0;
   if (!bash_parse_args(args, &command, &timeout_ms, done, ud)) {
@@ -816,9 +821,7 @@ static ToolExec *bash_execute(cJSON *args, ToolDoneCb done, void *ud)
   exec->ud = ud;
   exec->timeout_ms = timeout_ms;
   buf_init(&exec->output, kToolBashOutputCap);
-  exec->proc.data = exec;
-  exec->out.data = exec;
-  exec->timer.data = exec;
+  exec->proc.data = exec->out.data = exec->timer.data = exec; // back-pointers for the uv callbacks
   uv_loop_t *loop = loop_get();
   if (uv_pipe_init(loop, &exec->out, 0) != 0) { // cannot fail on a live loop
     fail(done, ud, "bash: pipe handle init failed");
@@ -948,6 +951,50 @@ static const ToolDef tool_defs[] = {
   },
 };
 
+// Tools registered from Lua (mua_register_tool): a flat capped array beside the
+// static built-ins -- tools_lookup and tools_build_openai_array scan both.
+// Bounded like every accumulator (code-safety). Mutable singleton; tools_teardown
+// frees it before the Lua state goes away.
+enum { kMaxRegisteredTools = 256 };
+static ToolDef g_registered[kMaxRegisteredTools];
+static size_t g_registered_count;
+
+// The one execute shared by every registered tool: marshal the cJSON args to an
+// Object, run the Lua callback through the bridge seam, then render the returned
+// Object as result content -- a string verbatim, anything else JSON-encoded.
+// Synchronous (the Lua VM is), so done fires inline and the handle is NULL.
+static ToolExec *registered_tool_execute(const ToolDef *def, cJSON *args, ToolDoneCb done, void *ud)
+{
+  Object args_obj = NIL;
+  Error err = ERROR_INIT;
+  if (!cjson_to_object(args, &args_obj, &err)) {
+    fail(done, ud, "%s: %s", def->name, err.msg != NULL ? err.msg : "invalid arguments");
+    api_clear_error(&err);
+    return NULL;
+  }
+  Object result = NIL;
+  bool is_error = false;
+  mua_lua_tool_invoke(def->callback, args_obj, &result, &is_error);
+  api_free_object(&args_obj);
+
+  char *content = NULL;
+  if (result.type == kObjectTypeString) {
+    // A string return (and every error message) becomes the content verbatim.
+    String str = result.data.string;
+    content = xstrndup(str.data != NULL ? str.data : "", str.size);
+  } else {
+    // Any other value is JSON-encoded, reusing the schema-side Object->cJSON.
+    cJSON *node = object_to_cjson(&result);
+    String printed = json_print(node);
+    json_free(node);
+    content = printed.data != NULL ? printed.data : xstrdup("null");
+  }
+  api_free_object(&result);
+  ToolResult tool_result = {.content = content, .is_error = is_error};
+  done(ud, &tool_result);
+  return NULL;
+}
+
 const ToolDef *tools_lookup(const char *name)
 {
   if (name == NULL) {
@@ -958,7 +1005,69 @@ const ToolDef *tools_lookup(const char *name)
       return &tool_defs[i];
     }
   }
+  for (size_t i = 0; i < g_registered_count; i++) {
+    if (strcmp(g_registered[i].name, name) == 0) {
+      return &g_registered[i];
+    }
+  }
   return NULL;
+}
+
+void tools_register(String name, String description, cJSON *schema, bool mutating,
+                    LuaRef callback, Error *err)
+{
+  if (name.data == NULL || name.size == 0) {
+    api_set_error(err, kErrorTypeValidation, "tool name is required");
+    return;
+  }
+  char *name_z = xstrndup(name.data, name.size);
+  if (tools_lookup(name_z) != NULL) {
+    api_set_error(err, kErrorTypeValidation, "tool '%s' is already registered", name_z);
+    xfree(name_z);
+    return;
+  }
+  if (g_registered_count >= kMaxRegisteredTools) {
+    api_set_error(err, kErrorTypeValidation, "too many registered tools (max %d)",
+                  kMaxRegisteredTools);
+    xfree(name_z);
+    return;
+  }
+  ToolDef *def = &g_registered[g_registered_count++];
+  def->name = name_z;
+  def->description =
+    (description.data != NULL) ? xstrndup(description.data, description.size) : xstrdup("");
+  def->params_schema = NULL;
+  def->schema_json = schema; // owned
+  def->execute = registered_tool_execute;
+  def->mutating = mutating;
+  def->callback = callback; // owned; unref'd in tools_teardown
+}
+
+void tools_teardown(void)
+{
+  for (size_t i = 0; i < g_registered_count; i++) {
+    ToolDef *def = &g_registered[i];
+    xfree((char *)def->name);
+    xfree((char *)def->description);
+    json_free(def->schema_json);
+    mua_lua_tool_unref(def->callback);
+    *def = (ToolDef){0};
+  }
+  g_registered_count = 0;
+}
+
+// Assembles one wire entry: {type:"function",function:{name,description,parameters}}.
+// Takes ownership of `params`.
+static cJSON *build_tool_entry(const char *name, const char *description, cJSON *params)
+{
+  cJSON *function = json_new_obj();
+  json_add_cstr(function, "name", name);
+  json_add_cstr(function, "description", description);
+  cJSON_AddItemToObject(function, "parameters", params);
+  cJSON *entry = json_new_obj();
+  json_add_cstr(entry, "type", "function");
+  cJSON_AddItemToObject(entry, "function", function);
+  return entry;
 }
 
 cJSON *tools_build_openai_array(Error *err)
@@ -975,14 +1084,12 @@ cJSON *tools_build_openai_array(Error *err)
       json_free(tools);
       return NULL;
     }
-    cJSON *function = json_new_obj();
-    json_add_cstr(function, "name", def->name);
-    json_add_cstr(function, "description", def->description);
-    cJSON_AddItemToObject(function, "parameters", params);
-    cJSON *entry = json_new_obj();
-    json_add_cstr(entry, "type", "function");
-    cJSON_AddItemToObject(entry, "function", function);
-    cJSON_AddItemToArray(tools, entry);
+    cJSON_AddItemToArray(tools, build_tool_entry(def->name, def->description, params));
+  }
+  for (size_t i = 0; i < g_registered_count; i++) {
+    const ToolDef *def = &g_registered[i];
+    cJSON *params = cJSON_Duplicate(def->schema_json, true); // deep copy; entry keeps its master
+    cJSON_AddItemToArray(tools, build_tool_entry(def->name, def->description, params));
   }
   return tools;
 }

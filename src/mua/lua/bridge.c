@@ -7,6 +7,8 @@
 
 #include "mua/api/global.h"
 #include "mua/api/private/helpers.h"
+#include "mua/lua/state.h"
+#include "mua/lua/tool.h"
 #include "mua/memory.h"
 
 // The C<->Lua bridge: it exposes the public C API mechanically as mua.api.mua_*
@@ -461,6 +463,82 @@ static int l_mua_get_var(lua_State *lstate)
     return raise_api_error(lstate, &err);
   }
   return 1;
+}
+
+// --- Registered-tool callback seam (declared in lua/tool.h) -------------------
+// tools.c (Lua-agnostic) calls these to run and release a Lua tool callback.
+// They speak Object only -- the cJSON<->Object conversion stays in tools.c -- so
+// cJSON never reaches this layer.
+
+// An owned String Object copied from `data`/`len` (NUL not required).
+static Object owned_string(const char *data, size_t len)
+{
+  return STRING_OBJ(api_string_dup((String){.data = (char *)data, .size = len}));
+}
+
+static Object owned_cstr(const char *str)
+{
+  return owned_string(str, str != NULL ? strlen(str) : 0);
+}
+
+void mua_lua_tool_invoke(LuaRef callback, Object args, Object *result_out, bool *is_error_out)
+{
+  lua_State *lstate = mua_lua_state();
+  *result_out = NIL;
+  *is_error_out = false;
+  if (!lua_checkstack(lstate, 4)) {
+    *result_out = owned_cstr("tool callback: lua stack exhausted");
+    *is_error_out = true;
+    return;
+  }
+  lua_rawgeti(lstate, LUA_REGISTRYINDEX, callback); // the stored callback function
+  Error err = ERROR_INIT;
+  if (!object_to_lua(lstate, &args, &err)) {
+    lua_pop(lstate, 1); // drop the function; nothing was called
+    *result_out = owned_cstr(err.msg != NULL ? err.msg : "tool args could not be marshaled");
+    *is_error_out = true;
+    api_clear_error(&err);
+    return;
+  }
+  if (lua_pcall(lstate, 1, 1, 0) != 0) {
+    size_t len = 0;
+    const char *msg = lua_tolstring(lstate, -1, &len); // error object coerced to a string
+    *result_out = (msg != NULL) ? owned_string(msg, len) : owned_cstr("tool callback raised");
+    *is_error_out = true;
+    lua_pop(lstate, 1);
+    return;
+  }
+  switch (lua_type(lstate, -1)) {
+    case LUA_TSTRING: {
+      size_t len = 0;
+      const char *str = lua_tolstring(lstate, -1, &len);
+      *result_out = owned_string(str, len); // returned verbatim as the content
+      break;
+    }
+    case LUA_TNIL:
+      *result_out = owned_string("", 0); // no output -> empty content
+      break;
+    default: {
+      // Any other value: marshal it to an Object for the caller to JSON-encode.
+      Arena arena = ARENA_INIT;
+      Object built = NIL;
+      if (lua_pop_object(lstate, lua_gettop(lstate), &arena, &built, &err)) {
+        *result_out = api_copy_object(&built); // heap-own; the arena build was transient
+      } else {
+        *result_out = owned_cstr(err.msg != NULL ? err.msg : "tool result could not be marshaled");
+        *is_error_out = true;
+        api_clear_error(&err);
+      }
+      arena_finish(&arena);
+      break;
+    }
+  }
+  lua_pop(lstate, 1); // drop the result
+}
+
+void mua_lua_tool_unref(LuaRef callback)
+{
+  luaL_unref(mua_lua_state(), LUA_REGISTRYINDEX, callback);
 }
 
 // Registered mechanically; mua.api.mua_* mirrors the C names one-to-one.

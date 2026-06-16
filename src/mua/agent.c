@@ -222,7 +222,7 @@ static ToolExec *start_tool(AgentTurn *turn, int idx)
   if (turn->cb.on_tool_start != NULL) {
     turn->cb.on_tool_start(turn->ud, def->name, args);
   }
-  ToolExec *exec = def->execute(args, agent_tool_done, turn);
+  ToolExec *exec = def->execute(def, args, agent_tool_done, turn);
   json_free(args); // the borrow ends when execute returns
   return exec;
 }
