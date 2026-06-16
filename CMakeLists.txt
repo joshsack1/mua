@@ -38,6 +38,7 @@ set_target_properties(cjson PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # visibility keeps internals reachable from test/unit).
 set(MUA_SOURCES
     src/mua/agent.c
+    src/mua/api/dispatch.c
     src/mua/api/global.c
     src/mua/api/private/helpers.c
     src/mua/api/session.c

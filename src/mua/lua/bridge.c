@@ -5,6 +5,7 @@
 
 #include <lauxlib.h>
 
+#include "mua/api/dispatch.h"
 #include "mua/api/global.h"
 #include "mua/api/private/helpers.h"
 #include "mua/api/session.h"
@@ -21,32 +22,6 @@
 // option storage lives in C; this layer only marshals values across and
 // translates API errors into Lua errors.
 
-// Marshal a Lua value (string / number / boolean / nil only) to an Object. The
-// string case borrows Lua's buffer -- options_set copies it before the value
-// leaves the stack. Length-prefixed: String is not NUL-terminated and a value
-// may carry embedded NULs.
-static Object lua_to_object(lua_State *lstate, int idx)
-{
-  switch (lua_type(lstate, idx)) {
-    case LUA_TSTRING: {
-      size_t len = 0;
-      const char *str = lua_tolstring(lstate, idx, &len);
-      return (Object){.type = kObjectTypeString, .data.string = {.data = (char *)str, .size = len}};
-    }
-    case LUA_TNUMBER: {
-      double num = (double)lua_tonumber(lstate, idx);
-      if (num >= -MUA_EXACT_INT_MAX && num <= MUA_EXACT_INT_MAX && num == (double)(Integer)num) {
-        return (Object){.type = kObjectTypeInteger, .data.integer = (Integer)num};
-      }
-      return (Object){.type = kObjectTypeFloat, .data.floating = num};
-    }
-    case LUA_TBOOLEAN:
-      return (Object){.type = kObjectTypeBoolean, .data.boolean = lua_toboolean(lstate, idx) != 0};
-    default:
-      return (Object){.type = kObjectTypeNil};
-  }
-}
-
 // Raise a Lua error carrying `err`'s message, freeing the C error first:
 // lua_error longjmps and never returns, so a clear placed after it would leak.
 static int raise_api_error(lua_State *lstate, Error *err)
@@ -54,60 +29,6 @@ static int raise_api_error(lua_State *lstate, Error *err)
   lua_pushstring(lstate, err->msg != NULL ? err->msg : "api error");
   api_clear_error(err);
   return lua_error(lstate);
-}
-
-static int l_mua_set_option(lua_State *lstate)
-{
-  size_t name_len = 0;
-  const char *name = luaL_checklstring(lstate, 1, &name_len);
-  int value_type = lua_type(lstate, 2);
-  if (value_type != LUA_TSTRING && value_type != LUA_TNUMBER && value_type != LUA_TBOOLEAN &&
-      value_type != LUA_TNIL) {
-    return luaL_argerror(lstate, 2, "option value must be a string, number, boolean, or nil");
-  }
-  String name_s = {.data = (char *)name, .size = name_len};
-  Object value = lua_to_object(lstate, 2);
-  Error err = ERROR_INIT;
-  mua_set_option(name_s, value, &err);
-  if (ERROR_SET(&err)) {
-    return raise_api_error(lstate, &err);
-  }
-  return 0;
-}
-
-static int l_mua_get_option(lua_State *lstate)
-{
-  size_t name_len = 0;
-  const char *name = luaL_checklstring(lstate, 1, &name_len);
-  String name_s = {.data = (char *)name, .size = name_len};
-  Error err = ERROR_INIT;
-  Object value = mua_get_option(name_s, &err);
-  if (ERROR_SET(&err)) {
-    return raise_api_error(lstate, &err);
-  }
-  if (value.type == kObjectTypeString) {
-    lua_pushlstring(lstate, value.data.string.data != NULL ? value.data.string.data : "",
-                    value.data.string.size);
-    api_free_string(value.data.string); // free the owned copy once Lua has copied it
-    return 1;
-  }
-  switch (value.type) {
-    case kObjectTypeNil:
-      lua_pushnil(lstate);
-      break;
-    case kObjectTypeBoolean:
-      lua_pushboolean(lstate, value.data.boolean);
-      break;
-    case kObjectTypeInteger:
-      lua_pushinteger(lstate, (lua_Integer)value.data.integer);
-      break;
-    case kObjectTypeFloat:
-      lua_pushnumber(lstate, value.data.floating);
-      break;
-    default:
-      return luaL_error(lstate, "option '%s' has an unsupported value type", name);
-  }
-  return 1;
 }
 
 // --- Value marshaling: arbitrary Lua values <-> Object (nested Array/Dict) ----
@@ -431,75 +352,44 @@ static bool object_to_lua(lua_State *lstate, const Object *obj, Error *err)
   return true;
 }
 
-static int l_mua_set_var(lua_State *lstate)
+// Maximum positional args any API function takes (set_*: name + value).
+enum { kMaxApiArgs = 8 };
+
+// The one Lua entry point for every table-driven API function: marshal the stack
+// args into an Object Array, invoke the metadata's dispatch fn, and push the
+// owned result. The closure's upvalue is the function's index into
+// api_dispatch_table(). The RPC server feeds the same fn, so the surface stays
+// single-sourced; here the only extra work is Lua<->Object marshaling.
+static int l_api_dispatch(lua_State *lstate)
 {
-  size_t name_len = 0;
-  const char *name = luaL_checklstring(lstate, 1, &name_len);
-  String name_s = {.data = (char *)name, .size = name_len};
+  size_t count = 0;
+  const ApiFnMeta *table = api_dispatch_table(&count);
+  const ApiFnMeta *meta = &table[(size_t)lua_tointeger(lstate, lua_upvalueindex(1))];
+  int argc = lua_gettop(lstate);
+  if (argc > kMaxApiArgs) {
+    return luaL_error(lstate, "%s: too many arguments", meta->name);
+  }
   Arena arena = ARENA_INIT;
-  Object value = NIL;
+  Object items[kMaxApiArgs];
   Error err = ERROR_INIT;
-  if (!lua_pop_object(lstate, 2, &arena, &value, &err)) {
-    arena_finish(&arena); // free the partial build tree before the longjmp
-    return raise_api_error(lstate, &err);
+  for (int i = 0; i < argc; i++) {
+    if (!lua_pop_object(lstate, i + 1, &arena, &items[i], &err)) {
+      arena_finish(&arena); // free the partial build tree before the longjmp
+      return raise_api_error(lstate, &err);
+    }
   }
-  mua_set_var(name_s, value, &err); // the store deep-copies onto the heap
-  arena_finish(&arena);             // release the transient build tree
+  Array args = {.items = items, .size = (size_t)argc, .capacity = (size_t)argc};
+  Object result = meta->fn(args, &err);
+  arena_finish(&arena); // the API copied what it kept; free the marshaled args
   if (ERROR_SET(&err)) {
+    api_free_object(&result); // NIL by convention on error; freed defensively
     return raise_api_error(lstate, &err);
   }
-  return 0;
-}
-
-static int l_mua_get_var(lua_State *lstate)
-{
-  size_t name_len = 0;
-  const char *name = luaL_checklstring(lstate, 1, &name_len);
-  String name_s = {.data = (char *)name, .size = name_len};
-  Error err = ERROR_INIT;
-  Object value = mua_get_var(name_s, &err);
-  if (ERROR_SET(&err)) {
-    api_free_object(&value);
-    return raise_api_error(lstate, &err);
-  }
-  bool ok = object_to_lua(lstate, &value, &err);
-  api_free_object(&value); // free the owned copy once Lua holds its own
+  bool ok = object_to_lua(lstate, &result, &err);
+  api_free_object(&result); // free the owned copy once Lua holds its own
   if (!ok) {
     return raise_api_error(lstate, &err);
   }
-  return 1;
-}
-
-// mua.api.mua_sess_get_messages(handle) -> the conversation as an array of
-// message tables. The handle defaults to 0 (current), as nvim_buf_* accept 0.
-static int l_mua_sess_get_messages(lua_State *lstate)
-{
-  Session handle = (Session)luaL_optinteger(lstate, 1, 0);
-  Error err = ERROR_INIT;
-  Array messages = mua_sess_get_messages(handle, &err);
-  if (ERROR_SET(&err)) {
-    return raise_api_error(lstate, &err); // empty Array on error: nothing to free
-  }
-  Object obj = ARRAY_OBJ(messages);
-  bool ok = object_to_lua(lstate, &obj, &err);
-  api_free_object(&obj); // free the owned copy once Lua holds its own
-  if (!ok) {
-    return raise_api_error(lstate, &err);
-  }
-  return 1;
-}
-
-// mua.api.mua_sess_get_id(handle) -> the session id string (handle defaults 0).
-static int l_mua_sess_get_id(lua_State *lstate)
-{
-  Session handle = (Session)luaL_optinteger(lstate, 1, 0);
-  Error err = ERROR_INIT;
-  String id = mua_sess_get_id(handle, &err);
-  if (ERROR_SET(&err)) {
-    return raise_api_error(lstate, &err);
-  }
-  lua_pushlstring(lstate, id.data != NULL ? id.data : "", id.size);
-  api_free_string(id); // free the owned copy once Lua has copied it
   return 1;
 }
 
@@ -774,17 +664,13 @@ bool mua_lua_autocmd_tool_pre(const char *name, Object args, char **reason_out)
   return vetoed;
 }
 
-// Registered mechanically; mua.api.mua_* mirrors the C names one-to-one.
-static const luaL_Reg api_functions[] = {
-  {"mua_set_option", l_mua_set_option},
-  {"mua_get_option", l_mua_get_option},
-  {"mua_set_var", l_mua_set_var},
-  {"mua_get_var", l_mua_get_var},
+// The Lua-only functions, registered as-is: register_tool/create_autocmd take a
+// LuaRef (a callback can't cross RPC), and clear_autocmds is a teardown helper
+// with no Error/since -- none belong in the shared dispatch table.
+static const luaL_Reg bespoke_functions[] = {
   {"mua_register_tool", l_mua_register_tool},
   {"mua_create_autocmd", l_mua_create_autocmd},
   {"mua_clear_autocmds", l_mua_clear_autocmds},
-  {"mua_sess_get_messages", l_mua_sess_get_messages},
-  {"mua_sess_get_id", l_mua_sess_get_id},
   {NULL, NULL},
 };
 
@@ -792,7 +678,16 @@ bool mua_lua_bridge_init(lua_State *lstate)
 {
   lua_newtable(lstate); // the `mua` table
   lua_newtable(lstate); // the `mua.api` subtable
-  for (const luaL_Reg *fn = api_functions; fn->name != NULL; fn++) {
+  // The marshalable API functions: one generic dispatch closure per entry, the
+  // function's table index carried as an upvalue. The same table drives RPC.
+  size_t count = 0;
+  const ApiFnMeta *table = api_dispatch_table(&count);
+  for (size_t i = 0; i < count; i++) {
+    lua_pushinteger(lstate, (lua_Integer)i);
+    lua_pushcclosure(lstate, l_api_dispatch, 1);
+    lua_setfield(lstate, -2, table[i].name);
+  }
+  for (const luaL_Reg *fn = bespoke_functions; fn->name != NULL; fn++) {
     lua_pushcfunction(lstate, fn->func);
     lua_setfield(lstate, -2, fn->name);
   }
