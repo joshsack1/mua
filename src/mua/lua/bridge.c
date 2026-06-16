@@ -7,6 +7,7 @@
 
 #include "mua/api/global.h"
 #include "mua/api/private/helpers.h"
+#include "mua/api/session.h"
 #include "mua/autocmd.h"
 #include "mua/log.h"
 #include "mua/lua/autocmd.h"
@@ -469,6 +470,39 @@ static int l_mua_get_var(lua_State *lstate)
   return 1;
 }
 
+// mua.api.mua_sess_get_messages(handle) -> the conversation as an array of
+// message tables. The handle defaults to 0 (current), as nvim_buf_* accept 0.
+static int l_mua_sess_get_messages(lua_State *lstate)
+{
+  Session handle = (Session)luaL_optinteger(lstate, 1, 0);
+  Error err = ERROR_INIT;
+  Array messages = mua_sess_get_messages(handle, &err);
+  if (ERROR_SET(&err)) {
+    return raise_api_error(lstate, &err); // empty Array on error: nothing to free
+  }
+  Object obj = ARRAY_OBJ(messages);
+  bool ok = object_to_lua(lstate, &obj, &err);
+  api_free_object(&obj); // free the owned copy once Lua holds its own
+  if (!ok) {
+    return raise_api_error(lstate, &err);
+  }
+  return 1;
+}
+
+// mua.api.mua_sess_get_id(handle) -> the session id string (handle defaults 0).
+static int l_mua_sess_get_id(lua_State *lstate)
+{
+  Session handle = (Session)luaL_optinteger(lstate, 1, 0);
+  Error err = ERROR_INIT;
+  String id = mua_sess_get_id(handle, &err);
+  if (ERROR_SET(&err)) {
+    return raise_api_error(lstate, &err);
+  }
+  lua_pushlstring(lstate, id.data != NULL ? id.data : "", id.size);
+  api_free_string(id); // free the owned copy once Lua has copied it
+  return 1;
+}
+
 // mua.api.mua_register_tool(name, description, schema, mutating, callback).
 // schema is a table (the JSON Schema for the tool's args) or nil; callback is
 // the implementing function. Held via luaL_ref; the registry owns it.
@@ -749,6 +783,8 @@ static const luaL_Reg api_functions[] = {
   {"mua_register_tool", l_mua_register_tool},
   {"mua_create_autocmd", l_mua_create_autocmd},
   {"mua_clear_autocmds", l_mua_clear_autocmds},
+  {"mua_sess_get_messages", l_mua_sess_get_messages},
+  {"mua_sess_get_id", l_mua_sess_get_id},
   {NULL, NULL},
 };
 

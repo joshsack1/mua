@@ -48,4 +48,17 @@ function mua.create_autocmd(event, opts)
   return mua.api.mua_create_autocmd(event, opts.callback)
 end
 
+-- mua.sess is the session-scoped read API (the nvim_buf_* analog). The handle
+-- defaults to 0 (the current session): get_messages returns the conversation of
+-- record as an array of { role = , content = , ... } tables, get_id the session
+-- id string. Wraps the raw mua.api.mua_sess_* surface.
+mua.sess = {
+  get_messages = function(handle)
+    return mua.api.mua_sess_get_messages(handle or 0)
+  end,
+  get_id = function(handle)
+    return mua.api.mua_sess_get_id(handle or 0)
+  end,
+}
+
 return mua

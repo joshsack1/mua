@@ -40,6 +40,7 @@ set(MUA_SOURCES
     src/mua/agent.c
     src/mua/api/global.c
     src/mua/api/private/helpers.c
+    src/mua/api/session.c
     src/mua/autocmd.c
     src/mua/http.c
     src/mua/json.c
