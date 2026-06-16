@@ -1,17 +1,17 @@
 # mua.api + Lua bridge — design
 
-**Status: in progress.** Delivered so far: the `mua.o` options bridge (the global API seam
-`mua_set_option`/`mua_get_option` in [global.c](../src/mua/api/global.c) annotated
-`FUNC_API_SINCE(1)`, the table-driven `mua.api.mua_*` registration in
-[bridge.c](../src/mua/lua/bridge.c), the C options store in [options.c](../src/mua/options.c),
-and the `mua.o` sugar in [runtime/lua/mua/init.lua](../runtime/lua/mua/init.lua));
-**Step 1** — Lua↔Object value marshaling and `mua.g`; **Step 2** — `mua_register_tool`,
-user-defined tools from Lua, with the `cjson_to_object`/`object_to_cjson` converter the later
-steps reuse; **Step 3** — the autocmd event set, dispatched from main.c at the agent's
-existing callback seams; and **Step 4** — the session scope `mua_sess_*`, the first integer-handle
-(`Session`) read API. This file is the design record for the milestone — the sequence that takes
-`mua.api` from "options only" to the full neovim-style surface (user tools, autocmd hooks, session
-scope, and an `--embed` RPC frontend).
+**Status: complete.** All five steps have landed. Delivered: the `mua.o` options bridge (the global
+API seam `mua_set_option`/`mua_get_option` in [global.c](../src/mua/api/global.c) annotated
+`FUNC_API_SINCE(1)`, the `mua.api.mua_*` registration in [bridge.c](../src/mua/lua/bridge.c), the C
+options store in [options.c](../src/mua/options.c), and the `mua.o` sugar in
+[runtime/lua/mua/init.lua](../runtime/lua/mua/init.lua)); **Step 1** — Lua↔Object value marshaling
+and `mua.g`; **Step 2** — `mua_register_tool`, user-defined tools from Lua, with the
+`cjson_to_object`/`object_to_cjson` converter the later steps reuse; **Step 3** — the autocmd event
+set, dispatched from main.c at the agent's existing callback seams; **Step 4** — the session scope
+`mua_sess_*`, the first integer-handle (`Session`) read API; and **Step 5** — the `--embed`
+msgpack-RPC server over a shared dispatch table that also drives the Lua bridge. This file is the
+design record for the milestone — the sequence that took `mua.api` from "options only" to the full
+neovim-style surface: user tools, autocmd hooks, session scope, and an `--embed` RPC frontend.
 
 These steps wrap the agent; they never bypass it. The load-bearing contracts they bind are
 the "Agent invariants" under Architecture in [CLAUDE.md](../CLAUDE.md) (the full design
@@ -248,7 +248,34 @@ The original design follows.
 - **Tests**: unit — handle `0` resolves, a bad handle → Validation error; functional — a
   tool or hook calls `mua_sess_get_messages(0)` and sees the conversation so far.
 
-### Step 5 — `--embed` msgpack-RPC server
+### Step 5 — `--embed` msgpack-RPC server — ✅ Landed
+
+**Landed** (`87536f0`, `d5e5e9d`, `4296382`). What shipped, and where it deviated from the design
+below:
+
+- **Shared dispatch table, hand-written (not a code generator).** A single `ApiFnMeta[]`
+  (`{name, dispatch-fn, since}`) in [api/dispatch.c](../src/mua/api/dispatch.c) holds the **6**
+  marshalable functions (`set/get_option`, `set/get_var`, `sess_get_messages/get_id`); each wrapper
+  adapts the real API fn to a uniform `Object (Array args, Error *)` shape. It drives **both** the
+  Lua bridge — the six bespoke `l_mua_*` getters/setters collapsed into one `l_api_dispatch` closure
+  (−105 lines in bridge.c) — and the RPC server. `register_tool`/`create_autocmd` take a `LuaRef`
+  (a callback can't cross RPC) and `clear_autocmds` has no `Error`/since, so all three stay bespoke
+  Lua wrappers, excluded from the table.
+- **Object↔msgpack is a hand-written codec** ([msgpack.c](../src/mua/msgpack.c), the third
+  marshaling axis), not a vendored library — matching mua's "few dependencies" stance. Iterative,
+  depth-capped walks mirroring json.c; the decoder is partial-input-aware (`kMsgpackIncomplete`) and
+  bounds container sizes against the remaining bytes so a lying huge count never allocates.
+- **Transport is `uv_pipe` on fd 0/1** ([rpc.c](../src/mua/rpc.c), Lua-free), dispatch synchronous
+  (no model calls in this mode), so a SIGINT handled by the loop stops it cleanly. The buffer is
+  capped (16 MiB); a malformed/oversized stream closes the channel; an unknown method or bad params
+  is an error response, never a crash. Stack-allocated handles are closed and drained before
+  `rpc_serve` returns on every path, so `loop_close` never touches freed memory.
+- **A read/write API server this slice**: `mua --embed` serves the 6 functions against the config
+  `init.lua` set up; it runs **no** agent turns and opens **no** session (so `mua_sess_*` cleanly
+  errors), and since no turn runs, no autocmd events fire — outbound RPC notifications are moot and
+  deferred. Driving a turn over RPC is future work.
+
+The original design follows.
 
 - **Goal**: drive mua from an external process over msgpack-RPC on stdio — the nvim `--embed`
   analog; the capstone that proves `mua.api` is a real surface, not just Lua glue.
