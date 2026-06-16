@@ -33,4 +33,13 @@ Object mua_get_var(String name, Error *err) FUNC_API_SINCE(2);
 void mua_register_tool(String name, String description, Object schema, Boolean mutating,
                        LuaRef callback, Error *err) FUNC_API_SINCE(3);
 
+// Registers a Lua callback (a LuaRef the store now owns) for lifecycle event
+// `event` -- one of "SessionStart"/"SessionEnd"/"ToolPre"/"ToolPost"/
+// "StreamDelta". Returns the new autocmd's id; an unknown event or a full store
+// sets a Validation error and returns 0. The nvim_create_autocmd analog.
+Integer mua_create_autocmd(String event, LuaRef callback, Error *err) FUNC_API_SINCE(3);
+
+// Removes every registered autocmd, releasing their callbacks.
+void mua_clear_autocmds(void);
+
 #endif // MUA_API_GLOBAL_H

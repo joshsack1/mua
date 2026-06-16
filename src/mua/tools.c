@@ -17,6 +17,7 @@
 #include "mua/json.h"
 #include "mua/log.h"
 #include "mua/loop.h"
+#include "mua/lua/ref.h"
 #include "mua/lua/tool.h"
 #include "mua/memory.h"
 #include "mua/paths.h"
@@ -1050,7 +1051,7 @@ void tools_teardown(void)
     xfree((char *)def->name);
     xfree((char *)def->description);
     json_free(def->schema_json);
-    mua_lua_tool_unref(def->callback);
+    mua_lua_unref(def->callback);
     *def = (ToolDef){0};
   }
   g_registered_count = 0;

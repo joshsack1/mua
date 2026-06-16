@@ -1,6 +1,7 @@
 #include "mua/api/global.h"
 
 #include "mua/api/private/helpers.h"
+#include "mua/autocmd.h"
 #include "mua/json.h"
 #include "mua/options.h"
 #include "mua/tools.h"
@@ -51,4 +52,20 @@ void mua_register_tool(String name, String description, Object schema, Boolean m
   if (ERROR_SET(err)) {
     json_free(schema_json); // registration refused it; release our converted copy
   }
+}
+
+Integer mua_create_autocmd(String event, LuaRef callback, Error *err)
+{
+  int resolved = autocmd_event_from_name(event);
+  if (resolved < 0) {
+    api_set_error(err, kErrorTypeValidation, "unknown autocmd event: %.*s", (int)event.size,
+                  event.data != NULL ? event.data : "");
+    return 0;
+  }
+  return autocmd_create((AutocmdEvent)resolved, callback, err);
+}
+
+void mua_clear_autocmds(void)
+{
+  autocmd_clear();
 }

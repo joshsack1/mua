@@ -7,6 +7,10 @@
 
 #include "mua/api/global.h"
 #include "mua/api/private/helpers.h"
+#include "mua/autocmd.h"
+#include "mua/log.h"
+#include "mua/lua/autocmd.h"
+#include "mua/lua/ref.h"
 #include "mua/lua/state.h"
 #include "mua/lua/tool.h"
 #include "mua/memory.h"
@@ -498,6 +502,34 @@ static int l_mua_register_tool(lua_State *lstate)
   return 0;
 }
 
+// mua.api.mua_create_autocmd(event, callback) -> id (1:1 with the C signature;
+// the nvim-style { callback = fn } opts table is the sugar in init.lua). The
+// store owns the ref. Returns the autocmd id.
+static int l_mua_create_autocmd(lua_State *lstate)
+{
+  size_t event_len = 0;
+  const char *event_name = luaL_checklstring(lstate, 1, &event_len);
+  luaL_checktype(lstate, 2, LUA_TFUNCTION);
+  lua_pushvalue(lstate, 2);
+  LuaRef callback = luaL_ref(lstate, LUA_REGISTRYINDEX); // pops the pushed copy
+  String event_s = {.data = (char *)event_name, .size = event_len};
+  Error err = ERROR_INIT;
+  Integer id = mua_create_autocmd(event_s, callback, &err);
+  if (ERROR_SET(&err)) {
+    luaL_unref(lstate, LUA_REGISTRYINDEX, callback); // unknown event / full store: release
+    return raise_api_error(lstate, &err);
+  }
+  lua_pushinteger(lstate, (lua_Integer)id);
+  return 1;
+}
+
+static int l_mua_clear_autocmds(lua_State *lstate)
+{
+  (void)lstate;
+  mua_clear_autocmds();
+  return 0;
+}
+
 // --- Registered-tool callback seam (declared in lua/tool.h) -------------------
 // tools.c (Lua-agnostic) calls these to run and release a Lua tool callback.
 // They speak Object only -- the cJSON<->Object conversion stays in tools.c -- so
@@ -569,9 +601,143 @@ void mua_lua_tool_invoke(LuaRef callback, Object args, Object *result_out, bool 
   lua_pop(lstate, 1); // drop the result
 }
 
-void mua_lua_tool_unref(LuaRef callback)
+void mua_lua_unref(LuaRef callback)
 {
   luaL_unref(mua_lua_state(), LUA_REGISTRYINDEX, callback);
+}
+
+// --- Autocmd dispatch seam (declared in lua/autocmd.h) ------------------------
+// Each fires every callback of an event with one payload table. cJSON never
+// reaches here: callers pass primitives / already-marshaled Objects. A throwing
+// hook is logged and skipped (nonfatal); a slow hook blocks the loop (the Lua
+// VM is single-threaded), as with tool callbacks.
+
+// Pushes a fresh payload table { event = <name> } and returns its stack index.
+static int autocmd_payload(lua_State *lstate, const char *event_name)
+{
+  lua_newtable(lstate);
+  int tidx = lua_gettop(lstate);
+  lua_pushstring(lstate, event_name);
+  lua_setfield(lstate, tidx, "event");
+  return tidx;
+}
+
+// Fires every callback of `event` with the payload table on top (left in place
+// for the caller to pop). Discards results; logs and continues on a throw.
+static void autocmd_fire(lua_State *lstate, AutocmdEvent event, const char *event_name)
+{
+  size_t n = autocmd_count(event);
+  for (size_t i = 0; i < n; i++) {
+    lua_rawgeti(lstate, LUA_REGISTRYINDEX, autocmd_ref_at(event, i));
+    lua_pushvalue(lstate, -2); // a fresh reference to the payload table
+    if (lua_pcall(lstate, 1, 0, 0) != 0) {
+      const char *msg = lua_tostring(lstate, -1);
+      log_msg(kLogWarn, "autocmd: %s hook error: %s", event_name, msg != NULL ? msg : "?");
+      lua_pop(lstate, 1); // the error object
+    }
+  }
+}
+
+void mua_lua_autocmd_session(AutocmdEvent event, const char *session_id)
+{
+  if (autocmd_count(event) == 0) {
+    return;
+  }
+  const char *name = (event == kAutocmdSessionStart) ? "SessionStart" : "SessionEnd";
+  lua_State *lstate = mua_lua_state();
+  if (!lua_checkstack(lstate, 4)) {
+    return;
+  }
+  int tidx = autocmd_payload(lstate, name);
+  lua_pushstring(lstate, session_id != NULL ? session_id : "");
+  lua_setfield(lstate, tidx, "session");
+  autocmd_fire(lstate, event, name);
+  lua_pop(lstate, 1); // the payload table
+}
+
+void mua_lua_autocmd_stream_delta(String text)
+{
+  if (autocmd_count(kAutocmdStreamDelta) == 0) {
+    return;
+  }
+  lua_State *lstate = mua_lua_state();
+  if (!lua_checkstack(lstate, 4)) {
+    return;
+  }
+  int tidx = autocmd_payload(lstate, "StreamDelta");
+  lua_pushlstring(lstate, text.data != NULL ? text.data : "", text.size);
+  lua_setfield(lstate, tidx, "text");
+  autocmd_fire(lstate, kAutocmdStreamDelta, "StreamDelta");
+  lua_pop(lstate, 1);
+}
+
+void mua_lua_autocmd_tool_post(const char *name, bool is_error, String content)
+{
+  if (autocmd_count(kAutocmdToolPost) == 0) {
+    return;
+  }
+  lua_State *lstate = mua_lua_state();
+  if (!lua_checkstack(lstate, 4)) {
+    return;
+  }
+  int tidx = autocmd_payload(lstate, "ToolPost");
+  lua_pushstring(lstate, name != NULL ? name : "");
+  lua_setfield(lstate, tidx, "tool");
+  lua_pushlstring(lstate, content.data != NULL ? content.data : "", content.size);
+  lua_setfield(lstate, tidx, "content");
+  lua_pushboolean(lstate, is_error);
+  lua_setfield(lstate, tidx, "error");
+  autocmd_fire(lstate, kAutocmdToolPost, "ToolPost");
+  lua_pop(lstate, 1);
+}
+
+bool mua_lua_autocmd_tool_pre(const char *name, Object args, char **reason_out)
+{
+  *reason_out = NULL;
+  size_t n = autocmd_count(kAutocmdToolPre);
+  if (n == 0) {
+    return false;
+  }
+  lua_State *lstate = mua_lua_state();
+  if (!lua_checkstack(lstate, 6)) {
+    log_msg(kLogWarn, "autocmd: ToolPre skipped (lua stack exhausted)");
+    return false;
+  }
+  int tidx = autocmd_payload(lstate, "ToolPre");
+  lua_pushstring(lstate, name != NULL ? name : "");
+  lua_setfield(lstate, tidx, "tool");
+  Error err = ERROR_INIT;
+  if (object_to_lua(lstate, &args, &err)) {
+    lua_setfield(lstate, tidx, "args");
+  } else {
+    api_clear_error(&err);
+    lua_settop(lstate, tidx); // discard any partial value object_to_lua left
+    lua_pushnil(lstate);
+    lua_setfield(lstate, tidx, "args");
+  }
+  bool vetoed = false;
+  for (size_t i = 0; i < n && !vetoed; i++) {
+    lua_rawgeti(lstate, LUA_REGISTRYINDEX, autocmd_ref_at(kAutocmdToolPre, i));
+    lua_pushvalue(lstate, tidx);
+    if (lua_pcall(lstate, 1, 1, 0) != 0) {
+      const char *msg = lua_tostring(lstate, -1);
+      log_msg(kLogWarn, "autocmd: ToolPre hook error: %s", msg != NULL ? msg : "?");
+      lua_pop(lstate, 1);
+      continue;
+    }
+    // A string return vetoes with that reason; false vetoes generically; else allow.
+    if (lua_type(lstate, -1) == LUA_TSTRING) {
+      size_t rlen = 0;
+      const char *reason = lua_tolstring(lstate, -1, &rlen);
+      *reason_out = xstrndup(reason, rlen);
+      vetoed = true;
+    } else if (lua_type(lstate, -1) == LUA_TBOOLEAN && !lua_toboolean(lstate, -1)) {
+      vetoed = true; // reason left NULL; the caller supplies a generic one
+    }
+    lua_pop(lstate, 1); // the return value
+  }
+  lua_pop(lstate, 1); // the payload table
+  return vetoed;
 }
 
 // Registered mechanically; mua.api.mua_* mirrors the C names one-to-one.
@@ -581,6 +747,8 @@ static const luaL_Reg api_functions[] = {
   {"mua_set_var", l_mua_set_var},
   {"mua_get_var", l_mua_get_var},
   {"mua_register_tool", l_mua_register_tool},
+  {"mua_create_autocmd", l_mua_create_autocmd},
+  {"mua_clear_autocmds", l_mua_clear_autocmds},
   {NULL, NULL},
 };
 

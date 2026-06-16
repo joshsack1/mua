@@ -18,8 +18,4 @@
 // VM is single-threaded, so a slow callback blocks the event loop.
 void mua_lua_tool_invoke(LuaRef callback, Object args, Object *result_out, bool *is_error_out);
 
-// Releases a registered callback's Lua reference; call before the Lua state is
-// torn down. A no-op for an absent (LUA_NOREF/LUA_REFNIL) ref.
-void mua_lua_tool_unref(LuaRef callback);
-
 #endif // MUA_LUA_TOOL_H
