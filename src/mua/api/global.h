@@ -25,4 +25,12 @@ void mua_set_var(String name, Object value, Error *err) FUNC_API_SINCE(2);
 // an unset name returns Nil, not an error.
 Object mua_get_var(String name, Error *err) FUNC_API_SINCE(2);
 
+// Registers a model-callable tool. `schema` is its JSON Schema parameters (a
+// Dict; Nil -> an empty-object schema); `mutating` routes it through the
+// approval gate; `callback` is a LuaRef the registry owns and invokes. Sets a
+// Validation error (registering nothing) on an empty or duplicate name, a
+// non-Dict schema, or a full registry. `name`/`description` are copied.
+void mua_register_tool(String name, String description, Object schema, Boolean mutating,
+                       LuaRef callback, Error *err) FUNC_API_SINCE(3);
+
 #endif // MUA_API_GLOBAL_H

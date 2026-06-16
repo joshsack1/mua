@@ -27,4 +27,15 @@ mua.g = setmetatable({}, {
   end,
 })
 
+-- mua.register_tool registers a model-callable tool implemented in Lua. spec
+-- fields: name (string), description (string), schema (a JSON Schema table for
+-- the args; optional), callback (function(args) -> result), and mutating
+-- (optional, default true -> the call goes through the approval gate). The raw
+-- mua.api.mua_register_tool is positional (name, description, schema, mutating,
+-- callback); this kwargs sugar is the ergonomic form.
+function mua.register_tool(spec)
+  assert(type(spec) == "table", "mua.register_tool expects a table")
+  mua.api.mua_register_tool(spec.name, spec.description, spec.schema, spec.mutating, spec.callback)
+end
+
 return mua

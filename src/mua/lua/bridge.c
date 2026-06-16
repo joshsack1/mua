@@ -465,6 +465,39 @@ static int l_mua_get_var(lua_State *lstate)
   return 1;
 }
 
+// mua.api.mua_register_tool(name, description, schema, mutating, callback).
+// schema is a table (the JSON Schema for the tool's args) or nil; callback is
+// the implementing function. Held via luaL_ref; the registry owns it.
+static int l_mua_register_tool(lua_State *lstate)
+{
+  size_t name_len = 0;
+  const char *name = luaL_checklstring(lstate, 1, &name_len);
+  size_t desc_len = 0;
+  const char *desc = luaL_optlstring(lstate, 2, "", &desc_len);
+  luaL_checktype(lstate, 5, LUA_TFUNCTION); // validate before allocating or ref'ing
+  // Schema (arg 3): a table -> Object, nil -> Nil (defaulted downstream). Built
+  // into an arena so a marshaling error frees cleanly across the lua_error longjmp.
+  Arena arena = ARENA_INIT;
+  Object schema = NIL;
+  Error err = ERROR_INIT;
+  if (!lua_isnoneornil(lstate, 3) && !lua_pop_object(lstate, 3, &arena, &schema, &err)) {
+    arena_finish(&arena);
+    return raise_api_error(lstate, &err);
+  }
+  bool mutating = lua_isnoneornil(lstate, 4) ? true : (lua_toboolean(lstate, 4) != 0);
+  lua_pushvalue(lstate, 5);
+  LuaRef callback = luaL_ref(lstate, LUA_REGISTRYINDEX); // pops the pushed copy
+  String name_s = {.data = (char *)name, .size = name_len};
+  String desc_s = {.data = (char *)desc, .size = desc_len};
+  mua_register_tool(name_s, desc_s, schema, mutating, callback, &err);
+  arena_finish(&arena); // the schema was copied to cJSON (or defaulted) downstream
+  if (ERROR_SET(&err)) {
+    luaL_unref(lstate, LUA_REGISTRYINDEX, callback); // registration failed; release the ref
+    return raise_api_error(lstate, &err);
+  }
+  return 0;
+}
+
 // --- Registered-tool callback seam (declared in lua/tool.h) -------------------
 // tools.c (Lua-agnostic) calls these to run and release a Lua tool callback.
 // They speak Object only -- the cJSON<->Object conversion stays in tools.c -- so
@@ -547,6 +580,7 @@ static const luaL_Reg api_functions[] = {
   {"mua_get_option", l_mua_get_option},
   {"mua_set_var", l_mua_set_var},
   {"mua_get_var", l_mua_get_var},
+  {"mua_register_tool", l_mua_register_tool},
   {NULL, NULL},
 };
 
