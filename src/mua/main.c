@@ -9,10 +9,12 @@
 #include "auto/versiondef.h"
 #include "mua/agent.h"
 #include "mua/api/private/helpers.h"
+#include "mua/autocmd.h"
 #include "mua/http.h"
 #include "mua/json.h"
 #include "mua/log.h"
 #include "mua/loop.h"
+#include "mua/lua/autocmd.h"
 #include "mua/lua/state.h"
 #include "mua/memory.h"
 #include "mua/options.h"
@@ -47,7 +49,8 @@ typedef struct {
   int outcome;     // kOutcomeUnset until on_finish fires
   bool wrote_any;
   bool last_was_newline;
-  bool failed_write; // a stdout write failed (EPIPE under `| head`)
+  bool failed_write;    // a stdout write failed (EPIPE under `| head`)
+  AgentGateFn base_gate; // the chosen policy; gate_with_autocmds wraps it
 } TurnCtx;
 
 static void print_usage(FILE *stream)
@@ -106,6 +109,7 @@ static void on_text(void *ud, const String *text)
   }
   ctx->wrote_any = true;
   ctx->last_was_newline = (text->data[text->size - 1] == '\n');
+  mua_lua_autocmd_stream_delta(*text); // StreamDelta hooks (no-op without one)
 }
 
 static void on_tool_start(void *ud, const char *name, const cJSON *args)
@@ -123,6 +127,7 @@ static void on_tool_result(void *ud, const char *name, const ToolResult *result)
 {
   (void)ud;
   (void)fprintf(stderr, "mua: <- %s: %s\n", name, result->is_error ? "error" : "ok");
+  mua_lua_autocmd_tool_post(name, result->is_error, cstr_as_string(result->content));
 }
 
 static void on_finish(void *ud, TurnOutcome outcome, const Error *err)
@@ -171,6 +176,34 @@ static SessionState *setup_session(bool resume, Error *err)
   return sess;
 }
 
+// Composing gate: a Lua ToolPre hook may veto any tool; otherwise the chosen
+// policy (ctx->base_gate) decides. ToolPre thus fires for every tool, while a
+// human y/N still applies only to mutating ones. A veto holds even under --yes
+// -- it is a programmatic policy, distinct from human approval.
+static GateDecision gate_with_autocmds(void *ud, const ToolDef *tool, const cJSON *args,
+                                       char **refusal_out)
+{
+  TurnCtx *ctx = ud;
+  if (autocmd_count(kAutocmdToolPre) > 0) {
+    Object args_obj = NIL;
+    Error err = ERROR_INIT;
+    if (cjson_to_object(args, &args_obj, &err)) {
+      char *reason = NULL;
+      bool vetoed = mua_lua_autocmd_tool_pre(tool->name, args_obj, &reason);
+      api_free_object(&args_obj);
+      if (vetoed) {
+        *refusal_out = (reason != NULL) ? reason : xstrdup("vetoed by a ToolPre hook");
+        return kGateRefuse;
+      }
+    } else {
+      log_msg(kLogWarn, "autocmd: ToolPre args marshal failed: %s",
+              err.msg != NULL ? err.msg : "?");
+      api_clear_error(&err);
+    }
+  }
+  return ctx->base_gate(ud, tool, args, refusal_out);
+}
+
 // Runs one turn to completion. Returns the exit code; *hard_stop is set when a
 // second SIGINT stopped the loop with the turn unfinished (on_finish never
 // fired) so the REPL can quit rather than reprompt.
@@ -178,12 +211,12 @@ static int run_one_turn(HttpClient *http, SessionState *sess, AgentGateFn gate, 
                         const char *api_key, const char *text, bool *hard_stop)
 {
   *hard_stop = false;
-  TurnCtx ctx = {.turn = NULL, .outcome = kOutcomeUnset};
+  TurnCtx ctx = {.turn = NULL, .outcome = kOutcomeUnset, .base_gate = gate};
   AgentOpts opts = {.http = http, .session = sess, .model = model, .api_key = api_key};
   AgentCallbacks cbs = {.on_text = on_text,
                         .on_tool_start = on_tool_start,
                         .on_tool_result = on_tool_result,
-                        .gate = gate,
+                        .gate = gate_with_autocmds,
                         .on_finish = on_finish};
   loop_run_nowait(); // drain a SIGINT pressed at the prompt before arming the turn
   Error err = ERROR_INIT;
@@ -279,6 +312,7 @@ static int run_agent(const MuaArgs *args)
     // Effective model: CLI -m wins, else mua.o.model from init.lua, else NULL
     // (the provider default). The store outlives the turn, so borrowing is safe.
     const char *model = args->model != NULL ? args->model : options_model_borrow();
+    mua_lua_autocmd_session(kAutocmdSessionStart, session_id(sess));
     if (args->prompt != NULL) {
       AgentGateFn gate = args->yes ? agent_gate_approve_all : agent_gate_auto_refuse;
       bool hard_stop = false;
@@ -286,6 +320,7 @@ static int run_agent(const MuaArgs *args)
     } else {
       code = run_repl(http, sess, model, api_key, args->yes);
     }
+    mua_lua_autocmd_session(kAutocmdSessionEnd, session_id(sess));
   }
   session_free(sess); // NULL-safe; the turn borrowed it and is finished
   http_client_close(http);
@@ -315,7 +350,8 @@ static int run(const MuaArgs *args)
       code = run_agent(args);
     }
   }
-  tools_teardown();  // unref Lua tool callbacks while the state is still alive
+  tools_teardown();    // unref Lua tool callbacks while the state is still alive
+  autocmd_teardown();  // likewise for autocmd callbacks
   mua_lua_teardown();
   options_free(); // release option copies set from init.lua
   if (!loop_close() && code == kExitOk) {

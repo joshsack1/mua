@@ -1,0 +1,114 @@
+local helpers = require("test.functional.helpers")
+
+-- End-to-end coverage of the autocmd event set: an init.lua fixture registers
+-- hooks that append markers to MUA_AUTOCMD_LOG, the SSE fixture drives a tool
+-- call then a final answer, and we assert which hooks fired (and that a ToolPre
+-- veto refused the tool). The first response is the tool call, the second the
+-- text, so every case sends two requests and one session start/end pair.
+
+local function tool_then_text(call, text)
+  return {
+    { { "send", helpers.tool_call_block({ call }) }, { "close" } },
+    { { "send", helpers.text_block(text) }, { "close" } },
+  }
+end
+
+-- Runs a turn whose first response calls `call`, with the hooks in `config_dir`
+-- logging to a temp file. Returns the run result, the captured requests, and
+-- the log file's lines.
+local function run(config_dir, call, prompt_args)
+  local dir = helpers.tmpdir()
+  local logfile = os.tmpname()
+  os.remove(logfile) -- the hooks create it on first append
+  local srv = helpers.start_sse_server(tool_then_text(call, "done"))
+  local env = helpers.mua_env(srv, dir)
+  env.MUA_CONFIG_DIR = config_dir
+  env.MUA_AUTOCMD_LOG = logfile
+  local r = helpers.run_mua(prompt_args, env)
+  local s = srv.finish()
+  local lines = {}
+  local f = io.open(logfile, "r")
+  if f then
+    for line in f:lines() do
+      lines[#lines + 1] = line
+    end
+    f:close()
+  end
+  os.remove(logfile)
+  helpers.rm_rf(dir)
+  return r, s, lines
+end
+
+local function has(lines, needle)
+  for _, line in ipairs(lines) do
+    if line:find(needle, 1, true) then
+      return true
+    end
+  end
+  return false
+end
+
+local function count_prefix(lines, prefix)
+  local n = 0
+  for _, line in ipairs(lines) do
+    if line:sub(1, #prefix) == prefix then
+      n = n + 1
+    end
+  end
+  return n
+end
+
+local FIX = "test/functional/fixtures/autocmd"
+
+describe("autocmd events", function()
+  it("fires ToolPre, ToolPost, StreamDelta, and Session events around a tool call", function()
+    local payload = os.tmpname()
+    local f = assert(io.open(payload, "wb"))
+    f:write("hello-file\n")
+    f:close()
+    local call = { id = "c1", name = "read", arguments = ('{"path":%q}'):format(payload) }
+    local r, s, lines = run(FIX, call, { "-p", "go" })
+    os.remove(payload)
+
+    assert.equal(0, r.code)
+    -- ToolPre fires for the ungated read tool: proof it fires for *every* tool.
+    assert.is_true(has(lines, "pre read"))
+    -- ToolPost fires with the (successful) result.
+    assert.is_true(has(lines, "post read err=false"))
+    -- Session events fire exactly once each.
+    assert.equal(1, count_prefix(lines, "start "))
+    assert.equal(1, count_prefix(lines, "end "))
+    -- StreamDelta saw the final answer.
+    assert.is_true(has(lines, "delta done"))
+    -- the read result reached the model.
+    assert.truthy(s.requests[2].body:find("hello-file", 1, true))
+  end)
+
+  it("a ToolPre hook vetoes a tool; the model sees the reason, the tool never runs", function()
+    -- The path mentions "secret", so the hook vetoes; read is never executed
+    -- (no real file needed).
+    local call = { id = "c2", name = "read", arguments = '{"path":"/tmp/has-secret-here.txt"}' }
+    local r, s, lines = run(FIX, call, { "-p", "go" })
+
+    assert.equal(0, r.code)
+    assert.is_true(has(lines, "pre read")) -- the hook fired
+    local req2 = s.requests[2].body
+    assert.truthy(req2:find("blocked: secret file", 1, true)) -- veto reason reached the model
+    -- A vetoed tool still "completes" with the synthetic error result.
+    assert.is_true(has(lines, "post read err=true"))
+  end)
+
+  it("a throwing hook is nonfatal: the tool still runs and the turn completes", function()
+    local payload = os.tmpname()
+    local f = assert(io.open(payload, "wb"))
+    f:write("survived\n")
+    f:close()
+    local call = { id = "c3", name = "read", arguments = ('{"path":%q}'):format(payload) }
+    local r, s, lines = run("test/functional/fixtures/autocmd_throw", call, { "-p", "go" })
+    os.remove(payload)
+
+    assert.equal(0, r.code) -- the throw was caught, not propagated
+    assert.is_true(has(lines, "threw for read")) -- the hook ran (then raised)
+    assert.truthy(s.requests[2].body:find("survived", 1, true)) -- a throw is not a veto
+  end)
+end)
