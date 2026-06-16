@@ -54,6 +54,7 @@ set(MUA_SOURCES
     src/mua/options.c
     src/mua/paths.c
     src/mua/provider/openrouter.c
+    src/mua/rpc.c
     src/mua/session.c
     src/mua/sse.c
     src/mua/tools.c

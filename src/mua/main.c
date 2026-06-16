@@ -18,6 +18,7 @@
 #include "mua/lua/state.h"
 #include "mua/memory.h"
 #include "mua/options.h"
+#include "mua/rpc.h"
 #include "mua/session.h"
 #include "mua/tools.h"
 
@@ -40,6 +41,7 @@ typedef struct {
   bool help;
   bool yes;
   bool resume;
+  bool embed;
   const char *prompt;
   const char *model;
 } MuaArgs;
@@ -57,7 +59,7 @@ static void print_usage(FILE *stream)
 {
   // Diagnostic path; nothing to do if the stream is gone.
   (void)fprintf(stream, "Usage: mua [--version] [--help] [-p TEXT] [-y|--yes] "
-                        "[-r|--resume] [-m|--model MODEL]\n");
+                        "[-r|--resume] [-m|--model MODEL] [--embed]\n");
 }
 
 static bool parse_args(int argc, char **argv, MuaArgs *out)
@@ -74,6 +76,8 @@ static bool parse_args(int argc, char **argv, MuaArgs *out)
       out->yes = true;
     } else if (strcmp(arg, "-r") == 0 || strcmp(arg, "--resume") == 0) {
       out->resume = true;
+    } else if (strcmp(arg, "--embed") == 0) {
+      out->embed = true;
     } else if (strcmp(arg, "-p") == 0 || strcmp(arg, "--prompt") == 0) {
       if (value == NULL) {
         (void)fprintf(stderr, "mua: missing argument for %s\n", arg);
@@ -349,7 +353,9 @@ static int run(const MuaArgs *args)
       code = kExitFailure;
     }
     if (code == kExitOk) {
-      code = run_agent(args);
+      // --embed serves the API over msgpack-RPC on stdio; it needs no API key
+      // and runs no agent turns, so it bypasses run_agent entirely.
+      code = args->embed ? rpc_serve() : run_agent(args);
     }
   }
   tools_teardown();    // unref Lua tool callbacks while the state is still alive
