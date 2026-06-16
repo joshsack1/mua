@@ -7,8 +7,9 @@
 and the `mua.o` sugar in [runtime/lua/mua/init.lua](../runtime/lua/mua/init.lua));
 **Step 1** — Lua↔Object value marshaling and `mua.g`; **Step 2** — `mua_register_tool`,
 user-defined tools from Lua, with the `cjson_to_object`/`object_to_cjson` converter the later
-steps reuse; and **Step 3** — the autocmd event set, dispatched from main.c at the agent's
-existing callback seams. This file is the design record for the milestone — the sequence that takes
+steps reuse; **Step 3** — the autocmd event set, dispatched from main.c at the agent's
+existing callback seams; and **Step 4** — the session scope `mua_sess_*`, the first integer-handle
+(`Session`) read API. This file is the design record for the milestone — the sequence that takes
 `mua.api` from "options only" to the full neovim-style surface (user tools, autocmd hooks, session
 scope, and an `--embed` RPC frontend).
 
@@ -205,7 +206,31 @@ mutating-only chokepoint, and `on_tool_start` was not used).
   refuses the tool (synthetic error, no execute); `SessionStart`/`SessionEnd` fire once each; a
   throwing hook is nonfatal.
 
-### Step 4 — Session scope `mua_sess_*`
+### Step 4 — Session scope `mua_sess_*` — ✅ Landed
+
+**Landed** (`4379ab8`, `8e85598`). What shipped, and where it deviated from the design below:
+
+- **A current-session registry, not yet a handle table.** The design called for a
+  handle→`SessionState *` table; with one implicit session, it shipped as a borrowed current-session
+  pointer + resolver (`session_set_current`/`session_resolve` in
+  [session.c](../src/mua/session.c), mutable singleton #6). main.c registers the run's session
+  before `SessionStart` and clears it (NULL) after `SessionEnd`, before `session_free`, so a stale
+  handle resolves to a clean error rather than freed memory. `0` resolves to it; every nonzero handle
+  is an unknown-handle Validation error today. `session_resolve` is the single seam a real
+  multi-session table later slots into without touching the API.
+- **The first integer-handle scope.** `mua_sess_get_messages(Session, Error *)` returns the
+  conversation as an owned `Array` of message Dicts; `mua_sess_get_id` the id `String`; `0` = current
+  (the `nvim_buf_*` analog), `FUNC_API_SINCE(4)`. New [api/session.c](../src/mua/api/session.c) — the
+  one-file-per-scope layout. Read-only: no append-from-Lua.
+- **Marshaling at the one boundary place.** `get_messages` converts `session_messages` cJSON→Object
+  via `cjson_to_object` inside the API layer (json.h's sanctioned spot) and returns an `Array`; the
+  bridge wraps it `ARRAY_OBJ`→`object_to_lua` and stays cJSON-free. The Array is a fresh copy, so it
+  outlives any later append — the borrow-lifetime pitfall below is dissolved by the copy; on the Lua
+  side only the integer handle is visible, so caching it is safe.
+- The bridge exposes `l_mua_sess_get_messages`/`l_mua_sess_get_id` (handle defaults to 0, like
+  `nvim_buf_*` accept 0); `mua.sess.get_messages`/`get_id` is the sugar.
+
+The original design follows.
 
 - **Goal**: a session-scoped read API — `mua_sess_get_messages(Session, Error *)`,
   `mua_sess_get_id(Session, Error *)` — with the `Session` handle and `0` = current, the
