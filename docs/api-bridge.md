@@ -4,10 +4,12 @@
 `mua_set_option`/`mua_get_option` in [global.c](../src/mua/api/global.c) annotated
 `FUNC_API_SINCE(1)`, the table-driven `mua.api.mua_*` registration in
 [bridge.c](../src/mua/lua/bridge.c), the C options store in [options.c](../src/mua/options.c),
-and the `mua.o` sugar in [runtime/lua/mua/init.lua](../runtime/lua/mua/init.lua)); and
-**Step 1 below** — Lua↔Object value marshaling and `mua.g`. This file is the design record for
-the milestone — the sequence that takes `mua.api` from "options only" to the full neovim-style
-surface (user tools, autocmd hooks, session scope, and an `--embed` RPC frontend).
+and the `mua.o` sugar in [runtime/lua/mua/init.lua](../runtime/lua/mua/init.lua));
+**Step 1** — Lua↔Object value marshaling and `mua.g`; and **Step 2** — `mua_register_tool`,
+user-defined tools from Lua, with the `cjson_to_object`/`object_to_cjson` converter that the
+remaining steps reuse. This file is the design record for the milestone — the sequence that takes
+`mua.api` from "options only" to the full neovim-style surface (user tools, autocmd hooks, session
+scope, and an `--embed` RPC frontend).
 
 These steps wrap the agent; they never bypass it. The load-bearing contracts they bind are
 the "Agent invariants" under Architecture in [CLAUDE.md](../CLAUDE.md) (the full design
@@ -107,7 +109,32 @@ The original design follows.
   `variables_free` in the FFI spec's `before_each` (one busted process shares one copy of the
   store); functional — `init.lua` sets `mua.g`, a later read sees it.
 
-### Step 2 — `mua_register_tool`
+### Step 2 — `mua_register_tool` — ✅ Landed
+
+**Landed** (`bfb7015`, `df16754`, `defcac3`). What shipped, and where it deviated from the design
+recorded below:
+
+- **Routed cJSON↔Object↔Lua, not a direct cJSON↔Lua walk.** The json.h boundary rule (cJSON never
+  crosses into Lua) won over the "walk against cJSON" sketch below: a new `cjson_to_object` /
+  `object_to_cjson` pair in [json.c](../src/mua/json.c) — the one-place converter that comment
+  always promised — feeds Step 1's `object_to_lua` / `lua_pop_object`, so the bridge stays
+  cJSON-free. Args go cJSON→Object (in tools.c) → Lua; the schema goes Lua→Object (bridge) →
+  cJSON (in `mua_register_tool`, the one place); a result goes Lua→Object → string verbatim, or
+  Object→cJSON→JSON string for a non-string return. The cJSON↔Object walk shares
+  `kMarshalDepthCap` (32), below cJSON's depth-64 limit, so deeper args/schemas are rejected.
+- **The callback is a `LuaRef` (a `typedef int` in [defs.h](../src/mua/api/private/defs.h)), a
+  dedicated parameter type — not an `Object` variant** (which would couple helpers.c's copy/free
+  to Lua). It is held via `luaL_ref`; tools.c stays Lua-agnostic, calling two seams in
+  [lua/tool.h](../src/mua/lua/tool.h) (`mua_lua_tool_invoke`/`mua_lua_tool_unref`, the
+  `nlua_call_ref` analog) that speak `Object` only.
+- **`ToolExecuteFn` gained a threaded `const ToolDef *def`** so one shared `registered_tool_execute`
+  serves every dynamic tool, reading its own callback off `def`; the four built-ins ignore it.
+- **Result contract** (resolved with the user): a string is content verbatim, any other value is
+  JSON-encoded, `nil` → empty, a raising callback → `is_error` (via `lua_pcall`). **Gated by
+  default**: `mutating` defaults to `true`. The raw `mua_register_tool` is positional; the kwargs
+  `mua.register_tool{...}` is the sugar. `FUNC_API_SINCE(3)`.
+
+The original design follows.
 
 - **Goal**: user-defined tools from Lua (`mua.api.mua_register_tool{name=, description=,
   schema=, callback=}`) — the `nvim_create_user_command` analog, and invariant #4 realized.
