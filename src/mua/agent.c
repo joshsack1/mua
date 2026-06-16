@@ -210,7 +210,9 @@ static ToolExec *start_tool(AgentTurn *turn, int idx)
   if (args == NULL) {
     return synthetic_result(turn, aformat("%s: arguments are not valid JSON", def->name));
   }
-  if (def->mutating && turn->cb.gate != NULL) {
+  // The gate is consulted before every tool; the policy approves non-mutating
+  // ones (read) without prompting, and a Lua ToolPre hook can veto any of them.
+  if (turn->cb.gate != NULL) {
     char *refusal = NULL;
     if (turn->cb.gate(turn->ud, def, args, &refusal) == kGateRefuse) {
       json_free(args);
@@ -549,6 +551,9 @@ GateDecision agent_gate_auto_refuse(void *ud, const ToolDef *tool, const cJSON *
 {
   (void)ud;
   (void)args;
+  if (!tool->mutating) {
+    return kGateApprove; // non-mutating tools (read) run without approval
+  }
   *refusal_out = aformat("%s requires approval; re-run with --yes", tool->name);
   return kGateRefuse;
 }
@@ -569,6 +574,9 @@ GateDecision agent_gate_interactive(void *ud, const ToolDef *tool, const cJSON *
 {
   (void)ud;
   (void)args;
+  if (!tool->mutating) {
+    return kGateApprove; // non-mutating tools (read) run without a prompt
+  }
   // Blocking is sound here: nothing user-visible is in flight at gate time
   // (the provider stream is terminal, the prior tool fully closed, the next
   // tool unstarted); only curl keep-alive polling defers, harmlessly.

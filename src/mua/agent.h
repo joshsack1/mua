@@ -21,8 +21,9 @@ typedef enum {
 
 typedef enum { kGateApprove = 0, kGateRefuse } GateDecision;
 
-// THE chokepoint the future Lua ToolPre hook wraps. Consulted for mutating
-// tools only; `read` runs ungated. A refusing gate may set *refusal_out
+// THE chokepoint, consulted before every tool call; the Lua ToolPre hooks wrap
+// it. Built-in policies approve non-mutating tools (`read`) without prompting,
+// so only mutating tools reach a human y/N. A refusing gate may set *refusal_out
 // (xmalloc'd; the agent frees it) to explain itself to the model.
 typedef GateDecision (*AgentGateFn)(void *ud, const ToolDef *tool, const cJSON *args,
                                     char **refusal_out);
