@@ -50,6 +50,7 @@ set(MUA_SOURCES
     src/mua/lua/bridge.c
     src/mua/lua/state.c
     src/mua/memory.c
+    src/mua/msgpack.c
     src/mua/options.c
     src/mua/paths.c
     src/mua/provider/openrouter.c
