@@ -496,3 +496,27 @@ const char *session_id(const SessionState *sess)
 {
   return sess->id;
 }
+
+// The current run's session, for handle resolution (documented mutable
+// singleton #6). A borrow: main.c owns the SessionState and clears this to NULL
+// before session_free, so session_resolve never hands back freed memory.
+static SessionState *g_current_session = NULL;
+
+void session_set_current(SessionState *sess)
+{
+  g_current_session = sess;
+}
+
+SessionState *session_resolve(Session handle, Error *err)
+{
+  if (handle != 0) {
+    // No multi-session table yet: only the current session (0) is addressable.
+    api_set_error(err, kErrorTypeValidation, "unknown session handle: %d", (int)handle);
+    return NULL;
+  }
+  if (g_current_session == NULL) {
+    api_set_error(err, kErrorTypeValidation, "no current session");
+    return NULL;
+  }
+  return g_current_session;
+}

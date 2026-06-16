@@ -43,6 +43,17 @@ const cJSON *session_message_get(const SessionState *sess, size_t idx);
 // The owned conversation array, borrowed for request building.
 const cJSON *session_messages(const SessionState *sess);
 const char *session_id(const SessionState *sess);
+
+// Current-session registry (handle resolution; 0 == current). A BORROW: main.c
+// owns the SessionState and clears this to NULL before session_free, so a stale
+// handle resolves to a clean error rather than freed memory. session_resolve is
+// the single seam a future handle table slots into without touching the API.
+void session_set_current(SessionState *sess);
+// Resolves a Session handle: 0 -> the current session (Validation error if
+// none), any other value -> unknown (Validation error). Never returns NULL
+// without setting err; never dereferences the resolved pointer.
+SessionState *session_resolve(Session handle, Error *err);
+
 void session_free(SessionState *sess);
 
 #endif // MUA_SESSION_H

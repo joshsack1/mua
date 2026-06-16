@@ -312,6 +312,7 @@ static int run_agent(const MuaArgs *args)
     // Effective model: CLI -m wins, else mua.o.model from init.lua, else NULL
     // (the provider default). The store outlives the turn, so borrowing is safe.
     const char *model = args->model != NULL ? args->model : options_model_borrow();
+    session_set_current(sess); // register the run's session so hooks resolve `0`
     mua_lua_autocmd_session(kAutocmdSessionStart, session_id(sess));
     if (args->prompt != NULL) {
       AgentGateFn gate = args->yes ? agent_gate_approve_all : agent_gate_auto_refuse;
@@ -321,6 +322,7 @@ static int run_agent(const MuaArgs *args)
       code = run_repl(http, sess, model, api_key, args->yes);
     }
     mua_lua_autocmd_session(kAutocmdSessionEnd, session_id(sess));
+    session_set_current(NULL); // clear the borrow before the SessionState is freed
   }
   session_free(sess); // NULL-safe; the turn borrowed it and is finished
   http_client_close(http);

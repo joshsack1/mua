@@ -14,6 +14,8 @@ t.cdef([[
   const cJSON *session_message_get(const SessionState *sess, size_t idx);
   const cJSON *session_messages(const SessionState *sess);
   const char *session_id(const SessionState *sess);
+  void session_set_current(SessionState *sess);
+  SessionState *session_resolve(int32_t handle, Error *err);
   void session_free(SessionState *sess);
 ]])
 
@@ -307,5 +309,31 @@ describe("session", function()
     -- oversize is validation, not I/O: the session is not poisoned
     assert.is_true(lib.session_append(sess, parse('{"role":"user","content":"ok"}'), err))
     lib.session_free(sess)
+  end)
+end)
+
+-- The current-session registry (handle resolution; 0 = current). session_resolve
+-- never dereferences the pointer, so a sentinel proves the wiring with no real
+-- session and no filesystem. The global is process-shared; reset it around use.
+describe("session_resolve", function()
+  it("resolves 0 to the current session and errors on absent/unknown handles", function()
+    local err = new_error()
+    lib.session_set_current(nil)
+    assert.is_true(lib.session_resolve(0, err) == nil) -- no current session
+    assert.equal(ffi.C.kErrorTypeValidation, err.type)
+    assert.truthy(ffi.string(err.msg):find("no current session", 1, true))
+    lib.api_clear_error(err)
+
+    local sentinel = ffi.cast("SessionState *", 0x1234)
+    lib.session_set_current(sentinel)
+    assert.is_true(lib.session_resolve(0, err) == sentinel) -- 0 -> current
+    assert.equal(ffi.C.kErrorTypeNone, err.type)
+
+    assert.is_true(lib.session_resolve(5, err) == nil) -- no multi-session table yet
+    assert.equal(ffi.C.kErrorTypeValidation, err.type)
+    assert.truthy(ffi.string(err.msg):find("unknown session handle", 1, true))
+    lib.api_clear_error(err)
+
+    lib.session_set_current(nil) -- leave the process-global clean for siblings
   end)
 end)
