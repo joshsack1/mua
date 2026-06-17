@@ -1,0 +1,9 @@
+mua
+Copyright 2026 Joshua Sack
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Bundled third-party code:
+
+- cJSON (src/cjson/): a vendored JSON parser by Dave Gamble and cJSON
+  contributors, distributed under the MIT License.

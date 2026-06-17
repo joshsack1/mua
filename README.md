@@ -92,3 +92,9 @@ luarocks config variables.LUA /opt/homebrew/bin/luajit
 
 Verify: `busted --version` runs, and `head -1 "$(command -v busted)"` references
 luajit.
+
+## License
+
+mua is licensed under the [Apache License 2.0](LICENSE). It bundles
+[cJSON](https://github.com/DaveGamble/cJSON) (MIT) under `src/cjson/`; see
+[NOTICE](NOTICE).
