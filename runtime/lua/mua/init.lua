@@ -39,12 +39,14 @@ function mua.register_tool(spec)
 end
 
 -- mua.create_autocmd registers a callback fired at a lifecycle event -- one of
--- "SessionStart", "SessionEnd", "ToolPre", "ToolPost", "StreamDelta". opts holds
--- the callback: function(ev) where ev is { event = <name>, ... }. Returns the
--- autocmd id. A ToolPre callback may return false (or a string reason) to veto
--- the tool call, or a table to rewrite the tool's arguments to that table (the
--- rewritten args are what runs, still subject to approval); other events ignore
--- the return. The nvim_create_autocmd shape.
+-- "SessionStart", "SessionEnd", "ToolPre", "ToolPost", "StreamDelta",
+-- "UserPromptPre". opts holds the callback: function(ev) where ev is
+-- { event = <name>, ... }. Returns the autocmd id. A ToolPre callback may return
+-- false (or a string reason) to veto the tool call, or a table to rewrite the
+-- tool's arguments to that table (the rewritten args are what runs, still subject
+-- to approval). A UserPromptPre callback (fired before the turn, ev.prompt holds
+-- the line) may return false to swallow the prompt (no turn runs) or a string to
+-- rewrite it; other events ignore the return. The nvim_create_autocmd shape.
 function mua.create_autocmd(event, opts)
   assert(type(opts) == "table", "mua.create_autocmd expects an options table")
   return mua.api.mua_create_autocmd(event, opts.callback)

@@ -373,8 +373,18 @@ static int run_repl(HttpClient *http, SessionState *sess, const char *model, con
     if (strcmp(line, "exit") == 0 || strcmp(line, "quit") == 0) {
       return kExitOk;
     }
+    // UserPromptPre runs before the turn (the input-side ToolPre): a hook may
+    // swallow the line (skip the turn) or rewrite it. `line` is a stack buffer; a
+    // rewrite is heap-owned and freed after the turn copies the text.
+    char *rewrite = NULL;
+    if (mua_lua_autocmd_user_prompt_pre(line, &rewrite)) {
+      xfree(rewrite); // swallowed: nothing to run, reprompt
+      continue;
+    }
+    const char *text = rewrite != NULL ? rewrite : line;
     bool hard_stop = false;
-    int code = run_one_turn(http, sess, gate, model, api_key, context_length, line, &hard_stop);
+    int code = run_one_turn(http, sess, gate, model, api_key, context_length, text, &hard_stop);
+    xfree(rewrite); // NULL-safe; the turn copied the text into the session
     if (hard_stop) {
       return code; // second SIGINT exits the REPL
     }
@@ -422,10 +432,19 @@ static int run_agent(const MuaArgs *args)
     session_set_current(sess); // register the run's session so hooks resolve `0`
     mua_lua_autocmd_session(kAutocmdSessionStart, session_id(sess));
     if (args->prompt != NULL) {
-      AgentGateFn gate = args->yes ? agent_gate_approve_all : agent_gate_auto_refuse;
-      bool hard_stop = false;
-      code =
-        run_one_turn(http, sess, gate, model, api_key, context_length, args->prompt, &hard_stop);
+      // UserPromptPre fires for the one-shot prompt too (uniform with the REPL): a
+      // hook may swallow it (no turn runs) or rewrite it before the single turn.
+      char *rewrite = NULL;
+      if (mua_lua_autocmd_user_prompt_pre(args->prompt, &rewrite)) {
+        xfree(rewrite); // swallowed: no turn to run
+        code = kExitOk;
+      } else {
+        const char *text = rewrite != NULL ? rewrite : args->prompt;
+        AgentGateFn gate = args->yes ? agent_gate_approve_all : agent_gate_auto_refuse;
+        bool hard_stop = false;
+        code = run_one_turn(http, sess, gate, model, api_key, context_length, text, &hard_stop);
+        xfree(rewrite); // NULL-safe; the turn copied the text
+      }
     } else {
       code = run_repl(http, sess, model, api_key, context_length, args->yes);
     }

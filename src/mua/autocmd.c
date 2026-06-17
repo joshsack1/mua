@@ -25,9 +25,12 @@ static const struct {
   const char *name;
   size_t len;
 } kEventNames[kAutocmdEventCount] = {
-  [kAutocmdSessionStart] = {"SessionStart", 12}, [kAutocmdSessionEnd] = {"SessionEnd", 10},
-  [kAutocmdToolPre] = {"ToolPre", 7},            [kAutocmdToolPost] = {"ToolPost", 8},
+  [kAutocmdSessionStart] = {"SessionStart", 12},
+  [kAutocmdSessionEnd] = {"SessionEnd", 10},
+  [kAutocmdToolPre] = {"ToolPre", 7},
+  [kAutocmdToolPost] = {"ToolPost", 8},
   [kAutocmdStreamDelta] = {"StreamDelta", 11},
+  [kAutocmdUserPromptPre] = {"UserPromptPre", 13},
 };
 
 int autocmd_event_from_name(String name)

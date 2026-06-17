@@ -16,6 +16,7 @@ typedef enum {
   kAutocmdToolPre,
   kAutocmdToolPost,
   kAutocmdStreamDelta,
+  kAutocmdUserPromptPre,
   kAutocmdEventCount, // sentinel: number of distinct events
 } AutocmdEvent;
 

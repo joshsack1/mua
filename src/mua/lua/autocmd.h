@@ -31,4 +31,13 @@ bool mua_lua_autocmd_tool_pre(const char *name, Object args, Object *rewrite_out
 // ToolPost: payload { event, tool, content, error }.
 void mua_lua_autocmd_tool_post(const char *name, bool is_error, String content);
 
+// UserPromptPre: payload { event, prompt }. Fires after a prompt is read and
+// before the turn is built -- the input-side analog of ToolPre. A hook returning
+// false swallows the prompt (no turn runs; the hook prints any user-facing
+// message itself), a string rewrites the prompt to that string (chaining to later
+// hooks), and any other return allows it unchanged. Returns whether the prompt was
+// swallowed; on an un-swallowed rewrite *rewrite_out gets an xmalloc'd string the
+// caller frees (xfree), else *rewrite_out is left NULL. `prompt` is borrowed.
+bool mua_lua_autocmd_user_prompt_pre(const char *prompt, char **rewrite_out);
+
 #endif // MUA_LUA_AUTOCMD_H

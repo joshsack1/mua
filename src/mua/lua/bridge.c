@@ -696,6 +696,55 @@ bool mua_lua_autocmd_tool_pre(const char *name, Object args, Object *rewrite_out
   return vetoed;
 }
 
+bool mua_lua_autocmd_user_prompt_pre(const char *prompt, char **rewrite_out)
+{
+  *rewrite_out = NULL;
+  size_t n = autocmd_count(kAutocmdUserPromptPre);
+  if (n == 0) {
+    return false;
+  }
+  lua_State *lstate = mua_lua_state();
+  if (!lua_checkstack(lstate, 6)) {
+    log_msg(kLogWarn, "autocmd: UserPromptPre skipped (lua stack exhausted)");
+    return false;
+  }
+  int tidx = autocmd_payload(lstate, "UserPromptPre");
+  lua_pushstring(lstate, prompt != NULL ? prompt : "");
+  lua_setfield(lstate, tidx, "prompt");
+  bool swallowed = false;
+  bool rewritten = false;
+  for (size_t i = 0; i < n && !swallowed; i++) {
+    lua_rawgeti(lstate, LUA_REGISTRYINDEX, autocmd_ref_at(kAutocmdUserPromptPre, i));
+    lua_pushvalue(lstate, tidx);
+    if (lua_pcall(lstate, 1, 1, 0) != 0) {
+      const char *msg = lua_tostring(lstate, -1);
+      log_msg(kLogWarn, "autocmd: UserPromptPre hook error: %s", msg != NULL ? msg : "?");
+      lua_pop(lstate, 1);
+      continue;
+    }
+    // string -> rewrite the prompt; false -> swallow (skip the turn); else allow.
+    int rt = lua_type(lstate, -1);
+    if (rt == LUA_TSTRING) {
+      lua_setfield(lstate, tidx, "prompt"); // update the payload so later hooks chain
+      rewritten = true;                     // (setfield pops the returned string)
+    } else if (rt == LUA_TBOOLEAN && !lua_toboolean(lstate, -1)) {
+      swallowed = true;
+      lua_pop(lstate, 1);
+    } else {
+      lua_pop(lstate, 1); // allow; discard the return value
+    }
+  }
+  if (!swallowed && rewritten) {
+    lua_getfield(lstate, tidx, "prompt");
+    size_t len = 0;
+    const char *s = lua_tolstring(lstate, -1, &len);
+    *rewrite_out = xstrndup(s != NULL ? s : "", len);
+    lua_pop(lstate, 1); // the prompt field value
+  }
+  lua_pop(lstate, 1); // the payload table
+  return swallowed;
+}
+
 // The Lua-only functions, registered as-is: register_tool/create_autocmd take a
 // LuaRef (a callback can't cross RPC), and clear_autocmds is a teardown helper
 // with no Error/since -- none belong in the shared dispatch table.
