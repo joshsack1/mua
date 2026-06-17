@@ -22,7 +22,7 @@ pkg_check_modules(LIBUV REQUIRED IMPORTED_TARGET libuv)
 # >=7.87 for CURL_WRITEFUNC_ERROR and curl_easy_header()
 pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl>=7.87)
 
-set(MUA_VERSION_PRERELEASE "-dev")
+set(MUA_VERSION_PRERELEASE "-dev" CACHE STRING "Version suffix; pass empty for a tagged release")
 configure_file(cmake/versiondef.h.in ${CMAKE_BINARY_DIR}/config/auto/versiondef.h)
 
 # Vendored cJSON: own target, no mua warning flags, SYSTEM include so -Werror
@@ -68,8 +68,12 @@ set_target_properties(mua_obj PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILI
 target_link_libraries(mua_obj PUBLIC mua_flags cjson PkgConfig::CURL PkgConfig::LIBUV
                                      PkgConfig::LUAJIT)
 target_include_directories(mua_obj PUBLIC ${PROJECT_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/config)
-# Dev-build default runtime location; installs will need a relocatable story.
-target_compile_definitions(mua_obj PRIVATE MUA_RUNTIME_PATH="${PROJECT_SOURCE_DIR}/runtime")
+# Runtime location baked into the binary (holds lua/mua/init.lua). Defaults to the
+# source tree for dev builds; a packaged build overrides it with the install path via
+# -DMUA_RUNTIME_PATH=... at configure time. The MUA_RUNTIME env var still wins at runtime.
+set(MUA_RUNTIME_PATH "${PROJECT_SOURCE_DIR}/runtime"
+    CACHE PATH "Runtime dir baked into the binary (holds lua/mua/init.lua)")
+target_compile_definitions(mua_obj PRIVATE MUA_RUNTIME_PATH="${MUA_RUNTIME_PATH}")
 
 add_executable(mua src/mua/main.c)
 target_link_libraries(mua PRIVATE mua_obj)
