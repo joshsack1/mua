@@ -216,13 +216,13 @@ static bool lua_pop_object(lua_State *lstate, int idx, Arena *arena, Object *out
   }
   PopFrame stack[kMarshalDepthCap];
   int depth = 0;
-  stack[depth++] = (PopFrame){.container = out,
-                              .lua_idx = idx,
-                              .is_array = out->type == kObjectTypeArray,
-                              .n = out->type == kObjectTypeArray ? out->data.array.size
-                                                                 : out->data.dict.size,
-                              .next = 0,
-                              .pop_table = false};
+  stack[depth++] =
+    (PopFrame){.container = out,
+               .lua_idx = idx,
+               .is_array = out->type == kObjectTypeArray,
+               .n = out->type == kObjectTypeArray ? out->data.array.size : out->data.dict.size,
+               .next = 0,
+               .pop_table = false};
   while (depth > 0) {
     PopFrame *f = &stack[depth - 1];
     if (f->next >= f->n) {
@@ -615,9 +615,30 @@ void mua_lua_autocmd_tool_post(const char *name, bool is_error, String content)
   lua_pop(lstate, 1);
 }
 
-bool mua_lua_autocmd_tool_pre(const char *name, Object args, char **reason_out)
+// Reads the (possibly hook-mutated) payload `args` field back into a heap Object
+// the caller owns. Mirrors mua_lua_tool_invoke's pop-copy-finish: the
+// lua_pop_object build is arena-transient, so api_copy_object lifts it to the heap.
+static Object capture_tool_pre_args(lua_State *lstate, int tidx)
+{
+  lua_getfield(lstate, tidx, "args");
+  Arena arena = ARENA_INIT;
+  Object built = NIL;
+  Object out = NIL;
+  Error err = ERROR_INIT;
+  if (lua_pop_object(lstate, lua_gettop(lstate), &arena, &built, &err)) {
+    out = api_copy_object(&built); // heap-own; the arena build was transient
+  } else {
+    api_clear_error(&err);
+  }
+  arena_finish(&arena);
+  lua_pop(lstate, 1); // the args field value
+  return out;
+}
+
+bool mua_lua_autocmd_tool_pre(const char *name, Object args, Object *rewrite_out, char **reason_out)
 {
   *reason_out = NULL;
+  *rewrite_out = NIL;
   size_t n = autocmd_count(kAutocmdToolPre);
   if (n == 0) {
     return false;
@@ -640,6 +661,7 @@ bool mua_lua_autocmd_tool_pre(const char *name, Object args, char **reason_out)
     lua_setfield(lstate, tidx, "args");
   }
   bool vetoed = false;
+  bool rewritten = false;
   for (size_t i = 0; i < n && !vetoed; i++) {
     lua_rawgeti(lstate, LUA_REGISTRYINDEX, autocmd_ref_at(kAutocmdToolPre, i));
     lua_pushvalue(lstate, tidx);
@@ -649,16 +671,26 @@ bool mua_lua_autocmd_tool_pre(const char *name, Object args, char **reason_out)
       lua_pop(lstate, 1);
       continue;
     }
-    // A string return vetoes with that reason; false vetoes generically; else allow.
-    if (lua_type(lstate, -1) == LUA_TSTRING) {
+    // string -> veto reason; false -> veto generic; table -> rewrite args; else allow.
+    int rt = lua_type(lstate, -1);
+    if (rt == LUA_TSTRING) {
       size_t rlen = 0;
       const char *reason = lua_tolstring(lstate, -1, &rlen);
       *reason_out = xstrndup(reason, rlen);
       vetoed = true;
-    } else if (lua_type(lstate, -1) == LUA_TBOOLEAN && !lua_toboolean(lstate, -1)) {
+      lua_pop(lstate, 1);
+    } else if (rt == LUA_TBOOLEAN && !lua_toboolean(lstate, -1)) {
       vetoed = true; // reason left NULL; the caller supplies a generic one
+      lua_pop(lstate, 1);
+    } else if (rt == LUA_TTABLE) {
+      lua_setfield(lstate, tidx, "args"); // update the payload so later hooks chain
+      rewritten = true;                   // (setfield pops the returned table)
+    } else {
+      lua_pop(lstate, 1); // allow; discard the return value
     }
-    lua_pop(lstate, 1); // the return value
+  }
+  if (!vetoed && rewritten) {
+    *rewrite_out = capture_tool_pre_args(lstate, tidx);
   }
   lua_pop(lstate, 1); // the payload table
   return vetoed;

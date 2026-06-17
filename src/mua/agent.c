@@ -26,17 +26,17 @@ struct AgentTurn {
   char *system_prompt; // resolved once at start; NULL means omit
   int step;            // completed tool rounds
   int step_cap;
-  int context_pct;          // hard budget: stop at this % of the context window
-  int context_warn_pct;     // soft warning: notice once at this % (0 disables)
+  int context_pct;           // hard budget: stop at this % of the context window
+  int context_warn_pct;      // soft warning: notice once at this % (0 disables)
   int64_t last_total_tokens; // most recent usage.total_tokens, 0 until seen
   bool context_warned;       // the soft warning fired this turn (one-shot)
-  OpenrouterStream *stream; // live while streaming, else NULL
-  ToolExec *exec;           // live while an async tool runs, else NULL
-  uv_timer_t step_timer;    // 0-ms deferral: the next request must be issued
-                            // outside provider (curl) callbacks, where
-                            // curl_multi_add_handle is illegal
-  const cJSON *assistant;   // borrowed from the session: this step's message
-  const cJSON *calls;       // borrowed tool_calls array of `assistant`
+  OpenrouterStream *stream;  // live while streaming, else NULL
+  ToolExec *exec;            // live while an async tool runs, else NULL
+  uv_timer_t step_timer;     // 0-ms deferral: the next request must be issued
+                             // outside provider (curl) callbacks, where
+                             // curl_multi_add_handle is illegal
+  const cJSON *assistant;    // borrowed from the session: this step's message
+  const cJSON *calls;        // borrowed tool_calls array of `assistant`
   int tool_index;
   int tool_count;
   bool in_driver;        // drive_tools is on the stack; done-cbs must not re-enter
@@ -247,12 +247,20 @@ static ToolExec *start_tool(AgentTurn *turn, int idx)
   // ones (read) without prompting, and a Lua ToolPre hook can veto any of them.
   if (turn->cb.gate != NULL) {
     char *refusal = NULL;
-    if (turn->cb.gate(turn->ud, def, args, &refusal) == kGateRefuse) {
+    cJSON *rewrite = NULL;
+    if (turn->cb.gate(turn->ud, def, args, &rewrite, &refusal) == kGateRefuse) {
+      if (rewrite != NULL) {
+        json_free(rewrite); // defensive: a refusing gate should not set it
+      }
       json_free(args);
       char *content = (refusal != NULL) ? refusal : xstrdup("refused by the tool gate");
       return synthetic_result(turn, content);
     }
     xfree(refusal); // an approving gate should not set it, but never leak
+    if (rewrite != NULL) {
+      json_free(args);
+      args = rewrite; // execute + on_tool_start observe the rewritten args
+    }
   }
   if (turn->cb.on_tool_start != NULL) {
     turn->cb.on_tool_start(turn->ud, def->name, args);
@@ -614,20 +622,22 @@ AgentTurn *agent_turn_start(const AgentOpts *opts, const AgentCallbacks *cb, voi
 }
 
 GateDecision agent_gate_approve_all(void *ud, const ToolDef *tool, const cJSON *args,
-                                    char **refusal_out)
+                                    cJSON **rewrite_out, char **refusal_out)
 {
   (void)ud;
   (void)tool;
   (void)args;
+  (void)rewrite_out;
   (void)refusal_out;
   return kGateApprove;
 }
 
 GateDecision agent_gate_auto_refuse(void *ud, const ToolDef *tool, const cJSON *args,
-                                    char **refusal_out)
+                                    cJSON **rewrite_out, char **refusal_out)
 {
   (void)ud;
   (void)args;
+  (void)rewrite_out;
   if (!tool->mutating) {
     return kGateApprove; // non-mutating tools (read) run without approval
   }
@@ -647,10 +657,11 @@ static void gate_drain_line(void)
 }
 
 GateDecision agent_gate_interactive(void *ud, const ToolDef *tool, const cJSON *args,
-                                    char **refusal_out)
+                                    cJSON **rewrite_out, char **refusal_out)
 {
   (void)ud;
   (void)args;
+  (void)rewrite_out;
   if (!tool->mutating) {
     return kGateApprove; // non-mutating tools (read) run without a prompt
   }

@@ -25,25 +25,28 @@ typedef enum { kGateApprove = 0, kGateRefuse } GateDecision;
 // THE chokepoint, consulted before every tool call; the Lua ToolPre hooks wrap
 // it. Built-in policies approve non-mutating tools (`read`) without prompting,
 // so only mutating tools reach a human y/N. A refusing gate may set *refusal_out
-// (xmalloc'd; the agent frees it) to explain itself to the model.
+// (xmalloc'd; the agent frees it) to explain itself to the model. A gate may also
+// set *rewrite_out to a new cJSON args object (the agent takes ownership and
+// executes those instead); only the ToolPre-composing gate does so, the policies
+// leave it NULL. The caller initializes both out-params to NULL.
 typedef GateDecision (*AgentGateFn)(void *ud, const ToolDef *tool, const cJSON *args,
-                                    char **refusal_out);
+                                    cJSON **rewrite_out, char **refusal_out);
 
 typedef struct {
   void (*on_text)(void *ud, const String *text); // live deltas, pass-through
   void (*on_tool_start)(void *ud, const char *name, const cJSON *args);
   void (*on_tool_result)(void *ud, const char *name, const ToolResult *result); // borrowed
   void (*on_notice)(void *ud, const String *msg); // out-of-band notice (e.g. context warning)
-  AgentGateFn gate;                                                   // NULL behaves as approve_all
+  AgentGateFn gate;                               // NULL behaves as approve_all
   void (*on_finish)(void *ud, TurnOutcome outcome, const Error *err); // exactly once
 } AgentCallbacks;
 
 typedef struct {
-  HttpClient *http;        // borrowed; the caller owns its lifecycle
-  SessionState *session;   // borrowed; the conversation of record
-  const char *model;       // NULL -> provider default
-  const char *api_key;     // required (the provider validates)
-  int64_t context_length;  // model's context window in tokens; 0 -> budget disabled
+  HttpClient *http;       // borrowed; the caller owns its lifecycle
+  SessionState *session;  // borrowed; the conversation of record
+  const char *model;      // NULL -> provider default
+  const char *api_key;    // required (the provider validates)
+  int64_t context_length; // model's context window in tokens; 0 -> budget disabled
 } AgentOpts;
 
 typedef struct AgentTurn AgentTurn;
@@ -72,10 +75,11 @@ bool agent_repair_session(SessionState *sess, Error *err);
 
 // The three gate policies, next to the loop (policy, not tools.c mechanism).
 GateDecision agent_gate_interactive(void *ud, const ToolDef *tool, const cJSON *args,
+                                    cJSON **rewrite_out,
                                     char **refusal_out); // blocking y/N on stderr/stdin
 GateDecision agent_gate_auto_refuse(void *ud, const ToolDef *tool, const cJSON *args,
-                                    char **refusal_out); // -p default
+                                    cJSON **rewrite_out, char **refusal_out); // -p default
 GateDecision agent_gate_approve_all(void *ud, const ToolDef *tool, const cJSON *args,
-                                    char **refusal_out); // --yes
+                                    cJSON **rewrite_out, char **refusal_out); // --yes
 
 #endif // MUA_AGENT_H

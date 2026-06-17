@@ -237,19 +237,35 @@ static SessionState *setup_session(bool resume, Error *err)
 // human y/N still applies only to mutating ones. A veto holds even under --yes
 // -- it is a programmatic policy, distinct from human approval.
 static GateDecision gate_with_autocmds(void *ud, const ToolDef *tool, const cJSON *args,
-                                       char **refusal_out)
+                                       cJSON **rewrite_out, char **refusal_out)
 {
   TurnCtx *ctx = ud;
+  const cJSON *effective = args; // the rewrite, if a hook returns one; else as-proposed
   if (autocmd_count(kAutocmdToolPre) > 0) {
     Object args_obj = NIL;
     Error err = ERROR_INIT;
     if (cjson_to_object(args, &args_obj, &err)) {
       char *reason = NULL;
-      bool vetoed = mua_lua_autocmd_tool_pre(tool->name, args_obj, &reason);
+      Object rewrite = NIL;
+      bool vetoed = mua_lua_autocmd_tool_pre(tool->name, args_obj, &rewrite, &reason);
       api_free_object(&args_obj);
       if (vetoed) {
+        api_free_object(&rewrite); // a veto wins; drop any pending rewrite (NIL-safe)
         *refusal_out = (reason != NULL) ? reason : xstrdup("vetoed by a ToolPre hook");
         return kGateRefuse;
+      }
+      if (rewrite.type != kObjectTypeNil) {
+        cJSON *new_args = object_to_cjson(&rewrite);
+        api_free_object(&rewrite);
+        if (new_args != NULL && cJSON_IsObject(new_args)) {
+          *rewrite_out = new_args; // the agent takes ownership and runs these
+          effective = new_args;    // the base gate (and its y/N) sees the rewrite
+        } else {
+          if (new_args != NULL) {
+            json_free(new_args); // tool args must be a JSON object; ignore otherwise
+          }
+          log_msg(kLogWarn, "autocmd: ToolPre rewrite ignored (not a JSON object)");
+        }
       }
     } else {
       log_msg(kLogWarn, "autocmd: ToolPre args marshal failed: %s",
@@ -257,7 +273,7 @@ static GateDecision gate_with_autocmds(void *ud, const ToolDef *tool, const cJSO
       api_clear_error(&err);
     }
   }
-  return ctx->base_gate(ud, tool, args, refusal_out);
+  return ctx->base_gate(ud, tool, effective, rewrite_out, refusal_out);
 }
 
 // Runs one turn to completion. Returns the exit code; *hard_stop is set when a
@@ -408,8 +424,8 @@ static int run_agent(const MuaArgs *args)
     if (args->prompt != NULL) {
       AgentGateFn gate = args->yes ? agent_gate_approve_all : agent_gate_auto_refuse;
       bool hard_stop = false;
-      code = run_one_turn(http, sess, gate, model, api_key, context_length, args->prompt,
-                          &hard_stop);
+      code =
+        run_one_turn(http, sess, gate, model, api_key, context_length, args->prompt, &hard_stop);
     } else {
       code = run_repl(http, sess, model, api_key, context_length, args->yes);
     }

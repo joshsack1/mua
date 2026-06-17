@@ -111,4 +111,36 @@ describe("autocmd events", function()
     assert.is_true(has(lines, "threw for read")) -- the hook ran (then raised)
     assert.truthy(s.requests[2].body:find("survived", 1, true)) -- a throw is not a veto
   end)
+
+  it("a ToolPre hook rewrites a read's path; the rewritten path is what executes", function()
+    -- The model asks to read a non-existent "_DECOY" path; the hook rewrites it to
+    -- the "_REAL" sibling we wrote. Proof: the real file's content reaches the model
+    -- -- the decoy never existed, so a missed rewrite would surface a read error.
+    local base = os.tmpname()
+    os.remove(base)
+    local real = base .. "_REAL"
+    local f = assert(io.open(real, "wb"))
+    f:write("REWRITTEN-CONTENT\n")
+    f:close()
+    local call = { id = "cr1", name = "read", arguments = ('{"path":%q}'):format(base .. "_DECOY") }
+    local r, s = run("test/functional/fixtures/autocmd_rewrite", call, { "-p", "go" })
+    os.remove(real)
+
+    assert.equal(0, r.code)
+    assert.truthy(s.requests[2].body:find("REWRITTEN-CONTENT", 1, true)) -- the rewrite executed
+  end)
+
+  it(
+    "a ToolPre rewrite of a mutating bash command still runs (under --yes) as rewritten",
+    function()
+      -- bash is mutating, so --yes lets it run; the hook rewrites the command and the
+      -- rewritten output is what comes back. Mirrors the grep->rg use case: the rewrite
+      -- changes what runs, while approval still applies (here, granted by --yes).
+      local call = { id = "cb1", name = "bash", arguments = '{"command":"echo original"}' }
+      local r, s = run("test/functional/fixtures/autocmd_rewrite", call, { "-y", "-p", "go" })
+
+      assert.equal(0, r.code)
+      assert.truthy(s.requests[2].body:find("rewritten", 1, true)) -- echo rewritten ran, not original
+    end
+  )
 end)

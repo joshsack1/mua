@@ -19,11 +19,14 @@ void mua_lua_autocmd_session(AutocmdEvent event, const char *session_id);
 // StreamDelta: payload { event, text }. Hot path (per provider chunk).
 void mua_lua_autocmd_stream_delta(String text);
 
-// ToolPre: payload { event, tool, args }. The only veto-capable event -- a hook
-// returning false vetoes (reason left NULL for the caller to generic-fill), a
-// string vetoes with that reason (xmalloc'd into *reason_out, caller frees).
-// Returns whether the call was vetoed. `args` is borrowed.
-bool mua_lua_autocmd_tool_pre(const char *name, Object args, char **reason_out);
+// ToolPre: payload { event, tool, args }. The only veto-or-rewrite event -- a
+// hook returning false vetoes (reason left NULL for the caller to generic-fill),
+// a string vetoes with that reason (xmalloc'd into *reason_out, caller frees),
+// and a table rewrites the args to that table. Returns whether the call was
+// vetoed; on an un-vetoed rewrite *rewrite_out gets a heap Object (the caller
+// owns it via api_free_object), else *rewrite_out is left NIL. `args` is borrowed.
+bool mua_lua_autocmd_tool_pre(const char *name, Object args, Object *rewrite_out,
+                              char **reason_out);
 
 // ToolPost: payload { event, tool, content, error }.
 void mua_lua_autocmd_tool_post(const char *name, bool is_error, String content);

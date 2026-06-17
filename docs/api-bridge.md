@@ -177,10 +177,18 @@ recorded below:
   `ToolPre` args cJSON→Object, the seam takes Object→Lua.
 - **Store is core** ([autocmd.c](../src/mua/autocmd.c), singleton #5, `{id, event, LuaRef}`); the
   four dispatch seams live in the bridge (reuse the static `object_to_lua`). `mua_lua_tool_unref`
-  generalized to a shared `mua_lua_unref` ([lua/ref.h](../src/mua/lua/ref.h)). **Veto convention**:
-  a hook returns `false` (generic) or a string reason; a throw is caught (nonfatal), not a veto.
+  generalized to a shared `mua_lua_unref` ([lua/ref.h](../src/mua/lua/ref.h)). **Veto/rewrite
+  convention**: a `ToolPre` hook returns `false` (generic) or a string reason to veto, or a table to
+  rewrite the tool's arguments to that table; a throw is caught (nonfatal), neither veto nor rewrite.
 - The callback receives one table `{ event, ... }`; raw `mua_create_autocmd(event, callback)` is 1:1
   with C, and `mua.create_autocmd(event, {callback=})` is the nvim-shaped sugar.
+- **`ToolPre` argument rewrite** (follow-on): a table return rewrites the args, extending the gate.
+  `AgentGateFn` gained a `cJSON **rewrite_out`; `mua_lua_autocmd_tool_pre` returns the rewritten args
+  as a heap `Object` (the bridge stays cJSON-free), `gate_with_autocmds` converts it `object_to_cjson`
+  and validates it is an object, and `start_tool` swaps `args` before execute. Hooks chain (each sees
+  the prior rewrite via the shared payload `args`); a veto still wins. Approval is orthogonal — the
+  rewritten args flow into the base gate, so a mutating tool still hits the y/N (now showing the
+  rewrite). The grep→rg-hook use case, expressed in user `init.lua`.
 
 The original design follows (note: `ToolPre` ended up at the composing gate for *all* tools, not the
 mutating-only chokepoint, and `on_tool_start` was not used).
