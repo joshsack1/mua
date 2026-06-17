@@ -7,9 +7,14 @@ local lib = t.lib
 t.cdef([[
   typedef struct OpenrouterStream OpenrouterStream;
   typedef struct {
+    int64_t prompt_tokens;
+    int64_t completion_tokens;
+    int64_t total_tokens;
+  } Usage;
+  typedef struct {
     void (*on_text)(void *ud, const String *text);
     void (*on_done)(void *ud, cJSON *message, const String *finish_reason,
-                    int64_t completion_tokens);
+                    const Usage *usage);
     void (*on_error)(void *ud, const Error *err);
   } OpenrouterCallbacks;
   bool openrouter_handle_event(OpenrouterStream *stream, String data);
@@ -39,14 +44,20 @@ local function make_harness()
     h.texts[#h.texts + 1] = view(text)
   end)
   h.on_done = ffi.cast(
-    "void (*)(void *, cJSON *, const String *, int64_t)",
-    function(_, message, reason, tokens)
+    "void (*)(void *, cJSON *, const String *, const Usage *)",
+    function(_, message, reason, usage)
       assert.is_nil(h.done, "on_done fired twice")
       local printed = lib.json_print(message)
       local text = ffi.string(printed.data, printed.size)
       lib.xfree(printed.data)
       lib.json_free(message)
-      h.done = { message = text, reason = view(reason), tokens = tonumber(tokens) }
+      h.done = {
+        message = text,
+        reason = view(reason),
+        tokens = tonumber(usage.completion_tokens),
+        prompt = tonumber(usage.prompt_tokens),
+        total = tonumber(usage.total_tokens),
+      }
     end
   )
   h.on_error = ffi.cast("void (*)(void *, const Error *)", function(_, err)
@@ -89,7 +100,9 @@ describe("openrouter event dispatch", function()
     assert.is_false(h:feed("[DONE]")) -- sentinel stops the transfer
     assert.same({ "Hel", "lo ", "world" }, h.texts)
     assert.equal("stop", h.done.reason)
-    assert.equal(0, h.done.tokens)
+    assert.equal(0, h.done.tokens) -- no usage object in this stream
+    assert.equal(0, h.done.prompt)
+    assert.equal(0, h.done.total)
     -- Content-only response: exact wire shape, no tool_calls key at all.
     assert.equal('{"role":"assistant","content":"Hello world"}', h.done.message)
     assert.same({}, h.errors)
@@ -109,13 +122,19 @@ describe("openrouter event dispatch", function()
     end
   end)
 
-  it("a usage chunk (empty choices) latches completion_tokens", function()
+  it("a usage chunk (empty choices) latches prompt/completion/total tokens", function()
     local h = make_harness()
     assert.is_true(h:feed('{"choices":[{"delta":{"content":"x"},"finish_reason":"stop"}]}'))
-    assert.is_true(h:feed('{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":42}}'))
+    assert.is_true(
+      h:feed(
+        '{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":42,"total_tokens":45}}'
+      )
+    )
     assert.is_false(h:feed("[DONE]"))
     assert.equal("stop", h.done.reason)
     assert.equal(42, h.done.tokens)
+    assert.equal(3, h.done.prompt)
+    assert.equal(45, h.done.total)
     assert.equal('{"role":"assistant","content":"x"}', h.done.message)
     h:free()
   end)
@@ -363,6 +382,8 @@ describe("openrouter tool_call accumulation", function()
     assert.is_false(h:feed("[DONE]"))
     assert.equal("tool_calls", h.done.reason)
     assert.equal(52, h.done.tokens)
+    assert.equal(578, h.done.prompt)
+    assert.equal(630, h.done.total)
     assert.equal(
       [=[{"role":"assistant","content":null,"tool_calls":[{"id":"toolu_vrtx_01TGPD8BXsALGUUK1j1qoDKt","type":"function","function":{"name":"bash","arguments":"{\"command\": \"ls\"}"}}]}]=],
       h.done.message

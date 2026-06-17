@@ -189,6 +189,119 @@ describe("agent tool round-trips", function()
     os.remove(payload)
     helpers.rm_rf(dir)
   end)
+
+  it("stops at the context-window budget without looping", function()
+    local dir = helpers.tmpdir()
+    local payload = os.tmpname()
+    local f = assert(io.open(payload, "wb"))
+    f:write("x\n")
+    f:close()
+    -- Block 1's usage reports total_tokens 950; with a 1000-token window at 90%
+    -- (budget 900) the loop stops after the first request. Block 2 is never asked.
+    local function read_block(id, total)
+      return {
+        {
+          "send",
+          helpers.tool_call_block({
+            { id = id, name = "read", arguments = ('{"path":%q}'):format(payload) },
+          }, total and { total = total } or nil),
+        },
+        { "close" },
+      }
+    end
+    -- Block 2 is scripted to prove no second request is made; the server's
+    -- watchdog exits quickly once block 1 is consumed and nothing more comes.
+    local srv = helpers.start_sse_server({ read_block("s1", 950), read_block("s2") }, { timeout_ms = 2000 })
+    local env = helpers.mua_env(srv, dir)
+    env.MUA_CONTEXT_LENGTH = "1000"
+    env.MUA_CONTEXT_PCT = "90"
+    env.MUA_CONTEXT_WARN_PCT = "0" -- isolate: only the budget message, no warning
+    local r = helpers.run_mua({ "-p", "loop" }, env)
+    local s = srv.finish()
+
+    assert.equal(1, r.code)
+    assert.equal(1, #s.requests) -- stopped before a second request
+    assert.truthy(r.stderr:match("context window budget"))
+    os.remove(payload)
+    helpers.rm_rf(dir)
+  end)
+
+  it("warns once when usage crosses the warn threshold, then continues", function()
+    local dir = helpers.tmpdir()
+    local payload = os.tmpname()
+    local f = assert(io.open(payload, "wb"))
+    f:write("x\n")
+    f:close()
+    -- Block 1 reports 800/1000 tokens: past the 75% warn line (750) but under the
+    -- 90% budget (900), so the turn warns and proceeds to block 2, which finishes.
+    local tool_block = {
+      {
+        "send",
+        helpers.tool_call_block({
+          { id = "s1", name = "read", arguments = ('{"path":%q}'):format(payload) },
+        }, { total = 800 }),
+      },
+      { "close" },
+    }
+    local done_block = { { "send", helpers.text_block("done") }, { "close" } }
+    local srv = helpers.start_sse_server({ tool_block, done_block })
+    local env = helpers.mua_env(srv, dir)
+    env.MUA_CONTEXT_LENGTH = "1000"
+    env.MUA_CONTEXT_PCT = "90"
+    env.MUA_CONTEXT_WARN_PCT = "75"
+    local r = helpers.run_mua({ "-p", "go" }, env)
+    local s = srv.finish()
+
+    assert.equal(0, r.code)
+    assert.equal(2, #s.requests) -- the warning did not stop the turn
+    assert.truthy(r.stderr:match("context window 80%% full"))
+    os.remove(payload)
+    helpers.rm_rf(dir)
+  end)
+
+  it("auto-fetches the model's context window from /models at startup", function()
+    local dir = helpers.tmpdir()
+    local payload = os.tmpname()
+    local f = assert(io.open(payload, "wb"))
+    f:write("x\n")
+    f:close()
+    -- The fixture replays one block per connection in order: connection 1 is the
+    -- startup GET /models, connection 2 is the turn. The catalog advertises a
+    -- 1000-token window for the model under test; with the turn reporting 950
+    -- tokens, the budget (90% -> 900) stops the loop after the one turn request.
+    local catalog = '{"data":[{"id":"test/model","context_length":1000,'
+      .. '"top_provider":{"context_length":1000}}]}'
+    local models_block = {
+      {
+        "send",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n" .. catalog,
+      },
+      { "close" },
+    }
+    local turn_block = {
+      {
+        "send",
+        helpers.tool_call_block({
+          { id = "s1", name = "read", arguments = ('{"path":%q}'):format(payload) },
+        }, { total = 950 }),
+      },
+      { "close" },
+    }
+    local srv = helpers.start_sse_server({ models_block, turn_block }, { timeout_ms = 4000 })
+    local env = helpers.mua_env(srv, dir)
+    env.MUA_CONTEXT_LENGTH = nil -- let the startup fetch run against the fixture
+    env.MUA_CONTEXT_WARN_PCT = "0"
+    local r = helpers.run_mua({ "-p", "go", "-m", "test/model" }, env)
+    local s = srv.finish()
+
+    assert.equal(1, r.code)
+    assert.equal(2, #s.requests) -- the GET /models, then one turn request
+    assert.equal("GET", s.requests[1].method)
+    assert.equal("/models", s.requests[1].path)
+    assert.truthy(r.stderr:match("context window budget"))
+    os.remove(payload)
+    helpers.rm_rf(dir)
+  end)
 end)
 
 describe("the REPL", function()

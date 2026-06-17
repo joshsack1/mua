@@ -26,7 +26,8 @@ typedef struct {
   const char *url;
   const char *const *headers; // "Name: value" strings, copied
   size_t header_count;        // <= MUA_HTTP_MAX_HEADERS
-  String body;                // POST body, copied; requests are POST this milestone
+  String body;                // POST body, copied (ignored when `get` is set)
+  bool get;                   // true: issue a GET (no body); default is POST
   long connect_timeout_ms;    // 0 selects MUA_HTTP_CONNECT_TIMEOUT_MS
   long stall_window_s;        // 0 selects MUA_HTTP_STALL_WINDOW_S
 } HttpRequestOpts;

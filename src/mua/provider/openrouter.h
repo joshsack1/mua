@@ -34,6 +34,16 @@ typedef struct {
   const char *base_url; // NULL: $OPENROUTER_BASE_URL, then MUA_OPENROUTER_BASE_URL
 } OpenrouterOpts;
 
+// Final-chunk token usage (OpenRouter always emits a usage object last).
+// prompt_tokens reflects the FULL conversation sent for this request -- it
+// grows every step; total_tokens = prompt + completion. All zero when the
+// stream carried no usage object.
+typedef struct {
+  int64_t prompt_tokens;
+  int64_t completion_tokens;
+  int64_t total_tokens;
+} Usage;
+
 // Exactly one of on_done/on_error fires, exactly once; the stream object is
 // invalid once that terminal callback returns.
 typedef struct {
@@ -41,7 +51,8 @@ typedef struct {
   // `message` is the COMPLETE wire-shaped assistant message ("role",
   // "content" string or null, optional "tool_calls"); OWNERSHIP TRANSFERS to
   // the callee, which must json_free it (or hand it on, e.g. to a session).
-  void (*on_done)(void *ud, cJSON *message, const String *finish_reason, int64_t completion_tokens);
+  // `usage` is borrowed: valid only for the duration of the call.
+  void (*on_done)(void *ud, cJSON *message, const String *finish_reason, const Usage *usage);
   void (*on_error)(void *ud, const Error *err);
 } OpenrouterCallbacks;
 

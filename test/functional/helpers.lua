@@ -187,7 +187,10 @@ end
 --- Env for driving mua against the fixture. MUA_STATE_DIR isolates the
 --- session store from the real ~/.local/state; MUA_SYSTEM_PROMPT="" omits the
 --- agent's injected system message so specs can assert the messages array
---- exactly; MUA_LOG="" keeps stderr assertions clean.
+--- exactly; MUA_LOG="" keeps stderr assertions clean. MUA_CONTEXT_LENGTH="0"
+--- disables the context budget AND the startup /models fetch -- otherwise every
+--- spec's first action would be an unscripted GET against the one-block-per-
+--- connection fixture; budget specs override it explicitly.
 ---@param srv table the start_sse_server handle
 ---@param state_dir string|nil reuse a dir across runs (resume); else a fresh one
 function M.mua_env(srv, state_dir)
@@ -198,6 +201,7 @@ function M.mua_env(srv, state_dir)
     MUA_STATE_DIR = state_dir or M.tmpdir(),
     MUA_SYSTEM_PROMPT = "",
     MUA_LOG = "",
+    MUA_CONTEXT_LENGTH = "0",
   }
 end
 
@@ -215,6 +219,18 @@ end
 
 M.FINISH = M.ev('{"choices":[{"delta":{},"finish_reason":"stop"}]}')
 M.DONE = M.ev("[DONE]")
+
+-- A trailing usage chunk (empty choices), as OpenRouter emits last. total_tokens
+-- is the running-context signal the agent budgets against.
+function M.usage_ev(prompt_tokens, completion_tokens, total_tokens)
+  return M.ev(
+    ('{"choices":[],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}'):format(
+      prompt_tokens,
+      completion_tokens,
+      total_tokens
+    )
+  )
+end
 
 -- A complete text-only assistant response.
 function M.text_block(text)
@@ -242,7 +258,9 @@ end
 --- then finish_reason:"tool_calls", then [DONE]. `calls` is an array of
 --- { id, name, arguments } where arguments is the (unescaped) JSON string the
 --- tool receives. Compose with sliced_block to cut mid-arguments on the wire.
-function M.tool_call_block(calls)
+--- Optional `usage` { prompt, completion, total } appends a trailing usage
+--- chunk before [DONE], to drive the context budget.
+function M.tool_call_block(calls, usage)
   local tcs = {}
   for i, c in ipairs(calls) do
     tcs[#tcs + 1] = ('{"index":%d,"id":%s,"type":"function","function":{"name":%s,"arguments":%s}}'):format(
@@ -258,7 +276,11 @@ function M.tool_call_block(calls)
       .. ']},"finish_reason":null}]}'
   )
   local last = M.ev('{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}')
-  return M.SSE_OK .. first .. last .. M.DONE
+  local body = M.SSE_OK .. first .. last
+  if usage then
+    body = body .. M.usage_ev(usage.prompt or 0, usage.completion or 1, usage.total or 0)
+  end
+  return body .. M.DONE
 end
 
 --- Slice `wire` at the given absolute byte offsets into send directives

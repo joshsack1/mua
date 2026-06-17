@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <cjson/cJSON.h>
 
@@ -18,6 +19,8 @@
 #include "mua/lua/state.h"
 #include "mua/memory.h"
 #include "mua/options.h"
+#include "mua/provider/models.h"
+#include "mua/render.h"
 #include "mua/rpc.h"
 #include "mua/session.h"
 #include "mua/tools.h"
@@ -33,7 +36,8 @@ enum {
   kReplLine = 8192,
   kReplDrainMax = 1 << 20,
   kToolArgPreview = 120,
-  kOutcomeUnset = -1, // distinguishes a second-SIGINT loop stop from a real finish
+  kOutcomeUnset = -1,      // distinguishes a second-SIGINT loop stop from a real finish
+  kRenderOutMax = 4 << 20, // styled-output buffer; drained+reset each feed, never accumulates
 };
 
 typedef struct {
@@ -51,8 +55,11 @@ typedef struct {
   int outcome;     // kOutcomeUnset until on_finish fires
   bool wrote_any;
   bool last_was_newline;
-  bool failed_write;    // a stdout write failed (EPIPE under `| head`)
+  bool failed_write;     // a stdout write failed (EPIPE under `| head`)
   AgentGateFn base_gate; // the chosen policy; gate_with_autocmds wraps it
+  bool render_on;        // markdown rendering: isatty(stdout) && mua.o.markdown, set per turn
+  Renderer rndr;         // markdown renderer state (used only when render_on)
+  Buf out;               // styled bytes drained to stdout via drain_out (only when render_on)
 } TurnCtx;
 
 static void print_usage(FILE *stream)
@@ -100,20 +107,46 @@ static bool parse_args(int argc, char **argv, MuaArgs *out)
   return true;
 }
 
+// Writes the renderer's styled bytes to stdout and resets the buffer. The
+// single styled-write site, so EPIPE handling stays in one place. Returns false
+// on a write failure (stdout gone under `| head`).
+static bool drain_out(TurnCtx *ctx)
+{
+  if (ctx->out.size == 0) {
+    return true;
+  }
+  if (fwrite(ctx->out.data, 1, ctx->out.size, stdout) != ctx->out.size || fflush(stdout) != 0) {
+    return false;
+  }
+  ctx->wrote_any = true;
+  buf_reset(&ctx->out);
+  return true;
+}
+
 static void on_text(void *ud, const String *text)
 {
   TurnCtx *ctx = ud;
   if (ctx->failed_write || text->size == 0) {
     return;
   }
-  if (fwrite(text->data, 1, text->size, stdout) != text->size || fflush(stdout) != 0) {
-    ctx->failed_write = true; // stdout is gone; stop the turn
-    agent_turn_cancel(ctx->turn);
-    return;
+  if (ctx->render_on) {
+    // Styled path: feed appends to ctx->out, drain_out writes it. A false from
+    // either is a write failure, handled exactly like the raw path below.
+    if (!render_feed(&ctx->rndr, *text, &ctx->out) || !drain_out(ctx)) {
+      ctx->failed_write = true;
+      agent_turn_cancel(ctx->turn);
+      return;
+    }
+  } else {
+    if (fwrite(text->data, 1, text->size, stdout) != text->size || fflush(stdout) != 0) {
+      ctx->failed_write = true; // stdout is gone; stop the turn
+      agent_turn_cancel(ctx->turn);
+      return;
+    }
+    ctx->wrote_any = true;
+    ctx->last_was_newline = (text->data[text->size - 1] == '\n');
   }
-  ctx->wrote_any = true;
-  ctx->last_was_newline = (text->data[text->size - 1] == '\n');
-  mua_lua_autocmd_stream_delta(*text); // StreamDelta hooks (no-op without one)
+  mua_lua_autocmd_stream_delta(*text); // StreamDelta hooks see RAW text (no-op without one)
 }
 
 static void on_tool_start(void *ud, const char *name, const cJSON *args)
@@ -134,13 +167,30 @@ static void on_tool_result(void *ud, const char *name, const ToolResult *result)
   mua_lua_autocmd_tool_post(name, result->is_error, cstr_as_string(result->content));
 }
 
+// Out-of-band agent notices (e.g. the context-window warning) go to stderr,
+// alongside the other chrome, leaving stdout for the model's output.
+static void on_notice(void *ud, const String *msg)
+{
+  (void)ud;
+  (void)fprintf(stderr, "mua: %.*s\n", (int)msg->size, msg->data != NULL ? msg->data : "");
+}
+
 static void on_finish(void *ud, TurnOutcome outcome, const Error *err)
 {
   TurnCtx *ctx = ud;
   ctx->outcome = (int)outcome;
+  // Flush any line the renderer was still buffering before deciding the
+  // trailing newline (the renderer owns whether output ended on a '\n', since
+  // it may have stripped a marker or added an SGR off-code as the last byte).
+  if (ctx->render_on && !ctx->failed_write) {
+    if (!render_flush(&ctx->rndr, &ctx->out) || !drain_out(ctx)) {
+      ctx->failed_write = true;
+    }
+  }
+  bool ended_newline = ctx->render_on ? ctx->rndr.ended_newline : ctx->last_was_newline;
   // Cosmetic trailing newline on success only; an error/interrupt leaves the
   // partial output as-is and explains itself on stderr.
-  if (outcome == kTurnDone && ctx->wrote_any && !ctx->last_was_newline && !ctx->failed_write) {
+  if (outcome == kTurnDone && ctx->wrote_any && !ended_newline && !ctx->failed_write) {
     (void)fputc('\n', stdout);
     (void)fflush(stdout);
   }
@@ -149,6 +199,8 @@ static void on_finish(void *ud, TurnOutcome outcome, const Error *err)
       (void)fprintf(stderr, "mua: %s\n", (err != NULL && err->msg != NULL) ? err->msg : "failed");
     } else if (outcome == kTurnStepCap) {
       (void)fprintf(stderr, "mua: step cap reached\n");
+    } else if (outcome == kTurnContextLimit) {
+      (void)fprintf(stderr, "mua: context window budget reached\n");
     } else if (outcome == kTurnInterrupted) {
       (void)fprintf(stderr, "mua: interrupted\n");
     }
@@ -212,14 +264,27 @@ static GateDecision gate_with_autocmds(void *ud, const ToolDef *tool, const cJSO
 // second SIGINT stopped the loop with the turn unfinished (on_finish never
 // fired) so the REPL can quit rather than reprompt.
 static int run_one_turn(HttpClient *http, SessionState *sess, AgentGateFn gate, const char *model,
-                        const char *api_key, const char *text, bool *hard_stop)
+                        const char *api_key, int64_t context_length, const char *text,
+                        bool *hard_stop)
 {
   *hard_stop = false;
   TurnCtx ctx = {.turn = NULL, .outcome = kOutcomeUnset, .base_gate = gate};
-  AgentOpts opts = {.http = http, .session = sess, .model = model, .api_key = api_key};
+  // Markdown rendering: opt-in (mua.o.markdown) and only on a real terminal, so
+  // piped output stays byte-identical. Decided once; the store is stable mid-run.
+  ctx.render_on = isatty(STDOUT_FILENO) && options_markdown();
+  if (ctx.render_on) {
+    render_init(&ctx.rndr);
+    buf_init(&ctx.out, kRenderOutMax);
+  }
+  AgentOpts opts = {.http = http,
+                    .session = sess,
+                    .model = model,
+                    .api_key = api_key,
+                    .context_length = context_length};
   AgentCallbacks cbs = {.on_text = on_text,
                         .on_tool_start = on_tool_start,
                         .on_tool_result = on_tool_result,
+                        .on_notice = on_notice,
                         .gate = gate_with_autocmds,
                         .on_finish = on_finish};
   loop_run_nowait(); // drain a SIGINT pressed at the prompt before arming the turn
@@ -231,6 +296,13 @@ static int run_one_turn(HttpClient *http, SessionState *sess, AgentGateFn gate, 
     return kExitFailure;
   }
   (void)loop_run();
+  if (ctx.render_on) {
+    // on_finish (inside loop_run) already flushed on a normal finish; on a
+    // second-SIGINT hard stop it never fired and the pending line is discarded,
+    // matching the "leave partial output as-is" contract on interrupt.
+    render_free(&ctx.rndr);
+    buf_free(&ctx.out);
+  }
   if (ctx.outcome == kOutcomeUnset) {
     *hard_stop = true; // second SIGINT: the loop stopped, the turn is unfinished
     return kExitInterrupted;
@@ -255,7 +327,7 @@ static void drain_line(void)
 }
 
 static int run_repl(HttpClient *http, SessionState *sess, const char *model, const char *api_key,
-                    bool yes)
+                    int64_t context_length, bool yes)
 {
   AgentGateFn gate = yes ? agent_gate_approve_all : agent_gate_interactive;
   (void)fprintf(stderr, "mua %s -- type 'exit' or Ctrl-D to quit\n", MUA_VERSION_STRING);
@@ -286,7 +358,7 @@ static int run_repl(HttpClient *http, SessionState *sess, const char *model, con
       return kExitOk;
     }
     bool hard_stop = false;
-    int code = run_one_turn(http, sess, gate, model, api_key, line, &hard_stop);
+    int code = run_one_turn(http, sess, gate, model, api_key, context_length, line, &hard_stop);
     if (hard_stop) {
       return code; // second SIGINT exits the REPL
     }
@@ -316,14 +388,30 @@ static int run_agent(const MuaArgs *args)
     // Effective model: CLI -m wins, else mua.o.model from init.lua, else NULL
     // (the provider default). The store outlives the turn, so borrowing is safe.
     const char *model = args->model != NULL ? args->model : options_model_borrow();
+    // The context-window budget needs the model's window. MUA_CONTEXT_LENGTH is
+    // a per-invocation override (and the test seam): when set it wins (0 there
+    // disables the budget); otherwise fetch it from the catalog once. A failed
+    // fetch returns 0 -> budget disabled, the step cap still governs.
+    int64_t context_length = 0;
+    const char *env_ctx = getenv("MUA_CONTEXT_LENGTH");
+    if (env_ctx != NULL && env_ctx[0] != '\0') {
+      char *end = NULL;
+      long value = strtol(env_ctx, &end, 10);
+      if (end != env_ctx && *end == '\0' && value >= 0) {
+        context_length = (int64_t)value;
+      }
+    } else {
+      context_length = models_fetch_context_length(http, model, api_key, NULL);
+    }
     session_set_current(sess); // register the run's session so hooks resolve `0`
     mua_lua_autocmd_session(kAutocmdSessionStart, session_id(sess));
     if (args->prompt != NULL) {
       AgentGateFn gate = args->yes ? agent_gate_approve_all : agent_gate_auto_refuse;
       bool hard_stop = false;
-      code = run_one_turn(http, sess, gate, model, api_key, args->prompt, &hard_stop);
+      code = run_one_turn(http, sess, gate, model, api_key, context_length, args->prompt,
+                          &hard_stop);
     } else {
-      code = run_repl(http, sess, model, api_key, args->yes);
+      code = run_repl(http, sess, model, api_key, context_length, args->yes);
     }
     mua_lua_autocmd_session(kAutocmdSessionEnd, session_id(sess));
     session_set_current(NULL); // clear the borrow before the SessionState is freed
@@ -358,8 +446,8 @@ static int run(const MuaArgs *args)
       code = args->embed ? rpc_serve() : run_agent(args);
     }
   }
-  tools_teardown();    // unref Lua tool callbacks while the state is still alive
-  autocmd_teardown();  // likewise for autocmd callbacks
+  tools_teardown();   // unref Lua tool callbacks while the state is still alive
+  autocmd_teardown(); // likewise for autocmd callbacks
   mua_lua_teardown();
   options_free(); // release option copies set from init.lua
   if (!loop_close() && code == kExitOk) {

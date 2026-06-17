@@ -51,11 +51,15 @@ can set agent options through `mua.o`, the neovim `vim.o`-style proxy:
 mua.o.system_prompt = "You are a terse Rust reviewer." -- "" omits the system message
 mua.o.model = "z-ai/glm-5.1"
 mua.o.step_cap = 30
+mua.o.markdown = true -- render markdown as ANSI on a TTY (default false)
 ```
 
 Precedence is environment variable (where one exists) > `init.lua` > built-in
 default; for `model`, the `-m` flag wins over `init.lua`. The default model is
 `anthropic/claude-sonnet-4.6`; `OPENROUTER_BASE_URL` overrides the API endpoint.
+With `mua.o.markdown` enabled, replies stream through a minimal markdown→ANSI
+renderer (headings, bold/italic, inline and fenced code) only when stdout is a
+terminal — piping (`mua -p … | tee`) stays byte-for-byte plain.
 `MUA_LOG=debug|info|warn|error` enables trace logging on stderr. Exit codes: 0
 success, 1 runtime/API failure, 64 usage error, 130 interrupted.
 

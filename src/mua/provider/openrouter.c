@@ -64,7 +64,9 @@ struct OpenrouterStream {
   bool finished;  // a terminal callback fired
   bool cancel_requested;
   char finish_reason[kOrFinishReasonCap];
+  int64_t prompt_tokens;
   int64_t completion_tokens;
+  int64_t total_tokens;
   Buf content; // full assistant text (on_text still streams deltas live)
   OrToolCall tool_calls[MUA_MAX_TOOL_CALLS];
   int tool_calls_hwm; // max present index + 1; assembly iterates [0, hwm)
@@ -156,7 +158,10 @@ static void fire_done(OpenrouterStream *stream)
   String reason = cstr_as_string(stream->finish_reason);
   if (stream->cb.on_done != NULL) {
     cJSON *msg = assemble_message(stream); // ownership transfers to the callee
-    stream->cb.on_done(stream->ud, msg, &reason, stream->completion_tokens);
+    Usage usage = {.prompt_tokens = stream->prompt_tokens,
+                   .completion_tokens = stream->completion_tokens,
+                   .total_tokens = stream->total_tokens};
+    stream->cb.on_done(stream->ud, msg, &reason, &usage);
   }
 }
 
@@ -274,8 +279,10 @@ bool openrouter_handle_event(OpenrouterStream *stream, String data)
   }
   cJSON *usage = json_get_obj(doc, "usage");
   if (usage != NULL) {
-    // Liberal acceptance: absent/mistyped usage simply leaves the latch.
+    // Liberal acceptance: absent/mistyped fields simply leave the latch.
+    (void)json_get_int(usage, "prompt_tokens", &stream->prompt_tokens);
     (void)json_get_int(usage, "completion_tokens", &stream->completion_tokens);
+    (void)json_get_int(usage, "total_tokens", &stream->total_tokens);
   }
   json_free(doc);
   return true;
@@ -480,7 +487,9 @@ static void start_attempt(OpenrouterStream *stream)
   // latches or accumulators. `delivered` deliberately persists — it gates
   // whether a retry is allowed at all.
   stream->finish_reason[0] = '\0';
+  stream->prompt_tokens = 0;
   stream->completion_tokens = 0;
+  stream->total_tokens = 0;
   buf_reset(&stream->content);
   for (int i = 0; i < MUA_MAX_TOOL_CALLS; i++) {
     stream->tool_calls[i].present = false;

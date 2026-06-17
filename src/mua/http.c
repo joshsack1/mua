@@ -378,14 +378,18 @@ static bool configure_transport(CURL *easy, const HttpRequestOpts *opts)
 static bool configure_request(HttpRequest *req, const HttpRequestOpts *opts)
 {
   CURL *easy = req->easy;
-  const char *body = (opts->body.data != NULL) ? opts->body.data : "";
-  curl_off_t body_size = (curl_off_t)opts->body.size;
-  return curl_easy_setopt(easy, CURLOPT_URL, opts->url) == CURLE_OK &&
-         curl_easy_setopt(easy, CURLOPT_POST, 1L) == CURLE_OK &&
+  bool ok = curl_easy_setopt(easy, CURLOPT_URL, opts->url) == CURLE_OK;
+  if (opts->get) {
+    ok = ok && curl_easy_setopt(easy, CURLOPT_HTTPGET, 1L) == CURLE_OK;
+  } else {
+    const char *body = (opts->body.data != NULL) ? opts->body.data : "";
+    curl_off_t body_size = (curl_off_t)opts->body.size;
+    ok = ok && curl_easy_setopt(easy, CURLOPT_POST, 1L) == CURLE_OK &&
          // Size first so NUL bytes in the body are preserved by the copy.
          curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE_LARGE, body_size) == CURLE_OK &&
-         curl_easy_setopt(easy, CURLOPT_COPYPOSTFIELDS, body) == CURLE_OK &&
-         curl_easy_setopt(easy, CURLOPT_HTTPHEADER, req->headers) == CURLE_OK &&
+         curl_easy_setopt(easy, CURLOPT_COPYPOSTFIELDS, body) == CURLE_OK;
+  }
+  return ok && curl_easy_setopt(easy, CURLOPT_HTTPHEADER, req->headers) == CURLE_OK &&
          curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_cb) == CURLE_OK &&
          curl_easy_setopt(easy, CURLOPT_WRITEDATA, req) == CURLE_OK &&
          curl_easy_setopt(easy, CURLOPT_ERRORBUFFER, req->errbuf) == CURLE_OK &&

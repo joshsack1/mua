@@ -26,6 +26,10 @@ struct AgentTurn {
   char *system_prompt; // resolved once at start; NULL means omit
   int step;            // completed tool rounds
   int step_cap;
+  int context_pct;          // hard budget: stop at this % of the context window
+  int context_warn_pct;     // soft warning: notice once at this % (0 disables)
+  int64_t last_total_tokens; // most recent usage.total_tokens, 0 until seen
+  bool context_warned;       // the soft warning fired this turn (one-shot)
   OpenrouterStream *stream; // live while streaming, else NULL
   ToolExec *exec;           // live while an async tool runs, else NULL
   uv_timer_t step_timer;    // 0-ms deferral: the next request must be issued
@@ -90,6 +94,35 @@ static int resolve_step_cap(void)
     }
   }
   return options_step_cap(); // mua.o value if set, else the built-in default; in range
+}
+
+// Precedence env > init.lua (mua.o.context_pct) > built-in default. Unlike the
+// step cap, the percent clamps to the full [MIN, MAX] range with no lower-only
+// floor: the step cap remains the hard bound, so the budget is purely advisory
+// of the model window. Shared shape with resolve_context_warn_pct below.
+static int resolve_pct_env(const char *name, int env_min, int env_max, int fallback)
+{
+  const char *env = getenv(name);
+  if (env != NULL && env[0] != '\0') {
+    char *end = NULL;
+    long value = strtol(env, &end, 10);
+    if (end != env && *end == '\0' && value >= env_min && value <= env_max) {
+      return (int)value;
+    }
+  }
+  return fallback;
+}
+
+static int resolve_context_pct(void)
+{
+  return resolve_pct_env("MUA_CONTEXT_PCT", MUA_CONTEXT_PCT_MIN, MUA_CONTEXT_PCT_MAX,
+                         options_context_pct());
+}
+
+static int resolve_context_warn_pct(void)
+{
+  return resolve_pct_env("MUA_CONTEXT_WARN_PCT", MUA_CONTEXT_WARN_PCT_MIN, MUA_CONTEXT_WARN_PCT_MAX,
+                         options_context_warn_pct());
 }
 
 // Frees the turn once its step_timer has closed (libuv needs the handle
@@ -297,13 +330,43 @@ static void provider_on_error(void *ud, const Error *perr)
   finish_turn(turn, kTurnFailed, &err);
 }
 
+// Fires the soft context warning at most once per turn, when the running token
+// usage crosses context_warn_pct of the window. A notice, not a request: safe
+// to call from inside the provider callback. No-op when the window is unknown,
+// the warning is disabled, or no usage has been seen yet.
+static void maybe_warn_context(AgentTurn *turn)
+{
+  if (turn->opts.context_length <= 0 || turn->context_warned || turn->context_warn_pct <= 0 ||
+      turn->cb.on_notice == NULL || turn->last_total_tokens <= 0) {
+    return;
+  }
+  int64_t warn_at = turn->opts.context_length * turn->context_warn_pct / 100;
+  if (turn->last_total_tokens < warn_at) {
+    return;
+  }
+  turn->context_warned = true;
+  int pct = (int)(turn->last_total_tokens * 100 / turn->opts.context_length);
+  char buf[128];
+  int need = snprintf(buf, sizeof buf, "context window %d%% full (%lld/%lld tokens)", pct,
+                      (long long)turn->last_total_tokens, (long long)turn->opts.context_length);
+  if (need < 0) {
+    return; // a formatting failure simply drops the notice
+  }
+  size_t len = (size_t)need < sizeof buf ? (size_t)need : sizeof buf - 1;
+  String msg = {.data = buf, .size = len};
+  turn->cb.on_notice(turn->ud, &msg);
+}
+
 static void provider_on_done(void *ud, cJSON *message, const String *finish_reason,
-                             int64_t completion_tokens)
+                             const Usage *usage)
 {
   AgentTurn *turn = ud;
   turn->stream = NULL;
   (void)finish_reason; // a nonempty tool_calls array is authoritative (contract 6)
-  (void)completion_tokens;
+  if (usage != NULL && usage->total_tokens > 0) {
+    turn->last_total_tokens = usage->total_tokens;
+  }
+  maybe_warn_context(turn);
   Error err = ERROR_INIT;
   if (!session_append(turn->opts.session, message, &err)) { // owns even on failure
     finish_turn(turn, kTurnFailed, &err);
@@ -398,6 +461,18 @@ static void next_step(AgentTurn *turn)
     Error none = ERROR_INIT;
     finish_turn(turn, kTurnStepCap, &none); // stop, never loop
     return;
+  }
+  // Second, independent stop: the running token usage approaches the model's
+  // context window. Usage only arrives in the last chunk, so the request that
+  // crosses the budget completes; we stop before issuing the next one. Disabled
+  // when the window is unknown (context_length == 0) or no usage seen yet.
+  if (turn->opts.context_length > 0 && turn->last_total_tokens > 0) {
+    int64_t budget = turn->opts.context_length * turn->context_pct / 100;
+    if (turn->last_total_tokens >= budget) {
+      Error none = ERROR_INIT;
+      finish_turn(turn, kTurnContextLimit, &none); // stop, never loop
+      return;
+    }
   }
   if (uv_timer_start(&turn->step_timer, step_timer_cb, 0, 0) != 0) {
     Error err = ERROR_INIT;
@@ -516,6 +591,8 @@ AgentTurn *agent_turn_start(const AgentOpts *opts, const AgentCallbacks *cb, voi
   turn->ud = ud;
   turn->system_prompt = resolve_system_prompt();
   turn->step_cap = resolve_step_cap();
+  turn->context_pct = resolve_context_pct();
+  turn->context_warn_pct = resolve_context_warn_pct();
   if (uv_timer_init(loop_get(), &turn->step_timer) != 0) {
     api_set_error(err, kErrorTypeException, "agent: step timer init failed");
     xfree(turn->system_prompt);

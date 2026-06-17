@@ -73,6 +73,11 @@ int loop_run_nowait(void)
   return uv_run(&g_loop.loop, UV_RUN_NOWAIT);
 }
 
+int loop_run_once(void)
+{
+  return uv_run(&g_loop.loop, UV_RUN_ONCE);
+}
+
 void loop_stop(void)
 {
   uv_stop(&g_loop.loop);

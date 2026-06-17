@@ -13,26 +13,45 @@
   "write, and edit files and to run shell commands in the current working "                        \
   "directory. Keep responses brief."
 
+// Field order keeps the two small members (type, bool_default) last so the
+// struct packs without excess padding; designated initializers below stay
+// readable regardless of layout.
 typedef struct {
   const char *name;
-  ObjectType type;
   const char *str_default; // string options: default text (NULL means Nil)
   Integer int_default;     // integer options: default value
   Integer int_min;         // integer options: inclusive range
-  Integer int_max;
+  Integer int_max;         // integer options: inclusive range
+  ObjectType type;
+  Boolean bool_default; // boolean options: default value
 } OptionDef;
 
 static const OptionDef option_defs[] = {
-  {"system_prompt", kObjectTypeString, MUA_DEFAULT_SYSTEM_PROMPT, 0, 0, 0},
-  {"model", kObjectTypeString, NULL, 0, 0, 0},
-  {"step_cap", kObjectTypeInteger, NULL, MUA_STEP_CAP_MAX, MUA_STEP_CAP_MIN, MUA_STEP_CAP_MAX},
+  {.name = "system_prompt", .type = kObjectTypeString, .str_default = MUA_DEFAULT_SYSTEM_PROMPT},
+  {.name = "model", .type = kObjectTypeString},
+  {.name = "step_cap",
+   .type = kObjectTypeInteger,
+   .int_default = MUA_STEP_CAP_MAX,
+   .int_min = MUA_STEP_CAP_MIN,
+   .int_max = MUA_STEP_CAP_MAX},
+  {.name = "markdown", .type = kObjectTypeBoolean, .bool_default = false},
+  {.name = "context_pct",
+   .type = kObjectTypeInteger,
+   .int_default = 90,
+   .int_min = MUA_CONTEXT_PCT_MIN,
+   .int_max = MUA_CONTEXT_PCT_MAX},
+  {.name = "context_warn_pct",
+   .type = kObjectTypeInteger,
+   .int_default = 75,
+   .int_min = MUA_CONTEXT_WARN_PCT_MIN,
+   .int_max = MUA_CONTEXT_WARN_PCT_MAX},
 };
 
 enum { kOptionCount = (int)(sizeof option_defs / sizeof option_defs[0]) };
 
 // Indices into option_defs[]/g_options[]; MUST match the table order above.
 // The typed getters assert their binding so a reorder fails loudly in debug.
-enum { kOptSystemPrompt = 0, kOptModel, kOptStepCap };
+enum { kOptSystemPrompt = 0, kOptModel, kOptStepCap, kOptMarkdown, kOptContextPct, kOptContextWarnPct };
 
 typedef struct {
   bool is_set;
@@ -83,6 +102,9 @@ static Object default_object(const OptionDef *def)
   }
   if (def->type == kObjectTypeInteger) {
     return (Object){.type = kObjectTypeInteger, .data.integer = def->int_default};
+  }
+  if (def->type == kObjectTypeBoolean) {
+    return (Object){.type = kObjectTypeBoolean, .data.boolean = def->bool_default};
   }
   return (Object){.type = kObjectTypeNil}; // string option with no default (e.g. model)
 }
@@ -145,6 +167,29 @@ int options_step_cap(void)
   assert(strcmp(option_defs[kOptStepCap].name, "step_cap") == 0);
   const OptionSlot *slot = &g_options[kOptStepCap];
   return slot->is_set ? (int)slot->value.data.integer : (int)option_defs[kOptStepCap].int_default;
+}
+
+bool options_markdown(void)
+{
+  assert(strcmp(option_defs[kOptMarkdown].name, "markdown") == 0);
+  const OptionSlot *slot = &g_options[kOptMarkdown];
+  return slot->is_set ? slot->value.data.boolean : option_defs[kOptMarkdown].bool_default;
+}
+
+int options_context_pct(void)
+{
+  assert(strcmp(option_defs[kOptContextPct].name, "context_pct") == 0);
+  const OptionSlot *slot = &g_options[kOptContextPct];
+  return slot->is_set ? (int)slot->value.data.integer
+                      : (int)option_defs[kOptContextPct].int_default;
+}
+
+int options_context_warn_pct(void)
+{
+  assert(strcmp(option_defs[kOptContextWarnPct].name, "context_warn_pct") == 0);
+  const OptionSlot *slot = &g_options[kOptContextWarnPct];
+  return slot->is_set ? (int)slot->value.data.integer
+                      : (int)option_defs[kOptContextWarnPct].int_default;
 }
 
 void options_free(void)

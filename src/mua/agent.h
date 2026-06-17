@@ -13,10 +13,11 @@
 // model stops or the step cap is hit. One AgentTurn per user input.
 
 typedef enum {
-  kTurnDone = 0,    // the model finished without further tool calls
-  kTurnFailed,      // provider or session failure (err carries the detail)
-  kTurnInterrupted, // canceled; unanswered tool calls got synthetic results
-  kTurnStepCap,     // the hard cap stopped the turn (stop, never loop)
+  kTurnDone = 0,     // the model finished without further tool calls
+  kTurnFailed,       // provider or session failure (err carries the detail)
+  kTurnInterrupted,  // canceled; unanswered tool calls got synthetic results
+  kTurnStepCap,      // the hard cap stopped the turn (stop, never loop)
+  kTurnContextLimit, // the context-window budget stopped the turn
 } TurnOutcome;
 
 typedef enum { kGateApprove = 0, kGateRefuse } GateDecision;
@@ -32,15 +33,17 @@ typedef struct {
   void (*on_text)(void *ud, const String *text); // live deltas, pass-through
   void (*on_tool_start)(void *ud, const char *name, const cJSON *args);
   void (*on_tool_result)(void *ud, const char *name, const ToolResult *result); // borrowed
+  void (*on_notice)(void *ud, const String *msg); // out-of-band notice (e.g. context warning)
   AgentGateFn gate;                                                   // NULL behaves as approve_all
   void (*on_finish)(void *ud, TurnOutcome outcome, const Error *err); // exactly once
 } AgentCallbacks;
 
 typedef struct {
-  HttpClient *http;      // borrowed; the caller owns its lifecycle
-  SessionState *session; // borrowed; the conversation of record
-  const char *model;     // NULL -> provider default
-  const char *api_key;   // required (the provider validates)
+  HttpClient *http;        // borrowed; the caller owns its lifecycle
+  SessionState *session;   // borrowed; the conversation of record
+  const char *model;       // NULL -> provider default
+  const char *api_key;     // required (the provider validates)
+  int64_t context_length;  // model's context window in tokens; 0 -> budget disabled
 } AgentOpts;
 
 typedef struct AgentTurn AgentTurn;

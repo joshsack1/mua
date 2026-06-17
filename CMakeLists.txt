@@ -53,7 +53,9 @@ set(MUA_SOURCES
     src/mua/msgpack.c
     src/mua/options.c
     src/mua/paths.c
+    src/mua/provider/models.c
     src/mua/provider/openrouter.c
+    src/mua/render.c
     src/mua/rpc.c
     src/mua/session.c
     src/mua/sse.c

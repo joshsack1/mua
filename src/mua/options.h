@@ -13,6 +13,11 @@
 // step_cap bounds, shared by the option table here and the agent's env clamp.
 enum { MUA_STEP_CAP_MIN = 1, MUA_STEP_CAP_MAX = 50 };
 
+// context_pct (hard stop) and context_warn_pct (soft warning) bounds: percent
+// of the model's context window. The warn percent allows 0 to disable it.
+enum { MUA_CONTEXT_PCT_MIN = 1, MUA_CONTEXT_PCT_MAX = 100 };
+enum { MUA_CONTEXT_WARN_PCT_MIN = 0, MUA_CONTEXT_WARN_PCT_MAX = 100 };
+
 // Sets option `name` to `value`. Validates that `name` is a known option and
 // `value`'s type matches the option's declared type (integer options are also
 // range-checked); on any mismatch sets a Validation error and leaves the store
@@ -30,6 +35,9 @@ Object options_get(String name, Error *err);
 const char *options_system_prompt(void); // effective prompt; "" means omit, never NULL
 const char *options_model_borrow(void);  // set model, or NULL if unset (-> provider default)
 int options_step_cap(void);              // effective cap, always within [MIN, MAX]
+bool options_markdown(void);             // markdown rendering toggle; default false
+int options_context_pct(void);           // context-window budget percent, within [MIN, MAX]
+int options_context_warn_pct(void);      // soft-warning percent, within [MIN, MAX]; 0 disables
 
 void options_free(void); // release all stored copies; reset to all-unset
 
