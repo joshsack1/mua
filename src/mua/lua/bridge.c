@@ -635,10 +635,12 @@ static Object capture_tool_pre_args(lua_State *lstate, int tidx)
   return out;
 }
 
-bool mua_lua_autocmd_tool_pre(const char *name, Object args, Object *rewrite_out, char **reason_out)
+bool mua_lua_autocmd_tool_pre(const char *name, Object args, Object *rewrite_out, bool *approve_out,
+                              char **reason_out)
 {
   *reason_out = NULL;
   *rewrite_out = NIL;
+  *approve_out = false;
   size_t n = autocmd_count(kAutocmdToolPre);
   if (n == 0) {
     return false;
@@ -662,6 +664,7 @@ bool mua_lua_autocmd_tool_pre(const char *name, Object args, Object *rewrite_out
   }
   bool vetoed = false;
   bool rewritten = false;
+  bool approved = false; // a hook returned boolean true: approve, skip the base gate
   for (size_t i = 0; i < n && !vetoed; i++) {
     lua_rawgeti(lstate, LUA_REGISTRYINDEX, autocmd_ref_at(kAutocmdToolPre, i));
     lua_pushvalue(lstate, tidx);
@@ -671,7 +674,8 @@ bool mua_lua_autocmd_tool_pre(const char *name, Object args, Object *rewrite_out
       lua_pop(lstate, 1);
       continue;
     }
-    // string -> veto reason; false -> veto generic; table -> rewrite args; else allow.
+    // string -> veto reason; false -> veto generic; true -> approve (skip the
+    // base gate); table -> rewrite args; else (nil, ...) defer to the base gate.
     int rt = lua_type(lstate, -1);
     if (rt == LUA_TSTRING) {
       size_t rlen = 0;
@@ -679,8 +683,12 @@ bool mua_lua_autocmd_tool_pre(const char *name, Object args, Object *rewrite_out
       *reason_out = xstrndup(reason, rlen);
       vetoed = true;
       lua_pop(lstate, 1);
-    } else if (rt == LUA_TBOOLEAN && !lua_toboolean(lstate, -1)) {
-      vetoed = true; // reason left NULL; the caller supplies a generic one
+    } else if (rt == LUA_TBOOLEAN) {
+      if (lua_toboolean(lstate, -1)) {
+        approved = true; // true -> approve outright; a later veto still overrides
+      } else {
+        vetoed = true; // false -> veto; reason left NULL, the caller generic-fills
+      }
       lua_pop(lstate, 1);
     } else if (rt == LUA_TTABLE) {
       lua_setfield(lstate, tidx, "args"); // update the payload so later hooks chain
@@ -692,7 +700,8 @@ bool mua_lua_autocmd_tool_pre(const char *name, Object args, Object *rewrite_out
   if (!vetoed && rewritten) {
     *rewrite_out = capture_tool_pre_args(lstate, tidx);
   }
-  lua_pop(lstate, 1); // the payload table
+  *approve_out = approved && !vetoed; // a veto (even after an approve) wins
+  lua_pop(lstate, 1);                 // the payload table
   return vetoed;
 }
 

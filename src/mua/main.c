@@ -232,10 +232,12 @@ static SessionState *setup_session(bool resume, Error *err)
   return sess;
 }
 
-// Composing gate: a Lua ToolPre hook may veto any tool; otherwise the chosen
+// Composing gate: a Lua ToolPre hook may veto any tool, approve it outright
+// (skipping the base gate and its y/N), or rewrite its args; otherwise the chosen
 // policy (ctx->base_gate) decides. ToolPre thus fires for every tool, while a
-// human y/N still applies only to mutating ones. A veto holds even under --yes
-// -- it is a programmatic policy, distinct from human approval.
+// human y/N applies only to the mutating ones a hook left to the base gate. A veto
+// holds even under --yes and beats a concurrent approve -- both are programmatic
+// policy, distinct from human approval.
 static GateDecision gate_with_autocmds(void *ud, const ToolDef *tool, const cJSON *args,
                                        cJSON **rewrite_out, char **refusal_out)
 {
@@ -247,7 +249,8 @@ static GateDecision gate_with_autocmds(void *ud, const ToolDef *tool, const cJSO
     if (cjson_to_object(args, &args_obj, &err)) {
       char *reason = NULL;
       Object rewrite = NIL;
-      bool vetoed = mua_lua_autocmd_tool_pre(tool->name, args_obj, &rewrite, &reason);
+      bool approve = false;
+      bool vetoed = mua_lua_autocmd_tool_pre(tool->name, args_obj, &rewrite, &approve, &reason);
       api_free_object(&args_obj);
       if (vetoed) {
         api_free_object(&rewrite); // a veto wins; drop any pending rewrite (NIL-safe)
@@ -266,6 +269,9 @@ static GateDecision gate_with_autocmds(void *ud, const ToolDef *tool, const cJSO
           }
           log_msg(kLogWarn, "autocmd: ToolPre rewrite ignored (not a JSON object)");
         }
+      }
+      if (approve) {
+        return kGateApprove; // a hook approved outright; skip the base gate (no prompt)
       }
     } else {
       log_msg(kLogWarn, "autocmd: ToolPre args marshal failed: %s",

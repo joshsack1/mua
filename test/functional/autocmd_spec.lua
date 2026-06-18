@@ -143,4 +143,35 @@ describe("autocmd events", function()
       assert.truthy(s.requests[2].body:find("rewritten", 1, true)) -- echo rewritten ran, not original
     end
   )
+
+  it("a ToolPre hook approving (return true) runs a mutating tool with no prompt", function()
+    -- In the REPL (interactive base gate, no --yes), the approve fixture returns
+    -- true for bash, so the call runs outright: no "allow bash" y/N prompt fires
+    -- and the command's output reaches the model. Proof the approve outcome skips
+    -- the base gate -- the no-prompt-for-allowlisted-commands case.
+    local dir = helpers.tmpdir()
+    local call = { id = "cap1", name = "bash", arguments = '{"command":"echo APPROVED_RAN"}' }
+    local srv = helpers.start_sse_server(tool_then_text(call, "done"))
+    local env = helpers.mua_env(srv, dir)
+    env.MUA_CONFIG_DIR = "test/functional/fixtures/autocmd_approve"
+    local r = helpers.run_mua({}, env, { stdin = "go\n" }) -- REPL; EOF ends it
+    local s = srv.finish()
+    helpers.rm_rf(dir)
+
+    assert.equal(0, r.code)
+    assert.is_nil(r.stderr:find("allow bash", 1, true)) -- the gate never prompted
+    assert.truthy(s.requests[2].body:find("APPROVED_RAN", 1, true)) -- the command ran
+  end)
+
+  it("a ToolPre approve runs a mutating tool under -p, which would otherwise refuse", function()
+    -- Under -p the base gate auto-refuses mutating tools; the approve hook makes
+    -- bash run anyway, so the real output reaches the model instead of the
+    -- synthetic "requires approval" refusal.
+    local call = { id = "cap2", name = "bash", arguments = '{"command":"echo APPROVED_RAN"}' }
+    local r, s = run("test/functional/fixtures/autocmd_approve", call, { "-p", "go" })
+
+    assert.equal(0, r.code)
+    assert.truthy(s.requests[2].body:find("APPROVED_RAN", 1, true))
+    assert.is_nil(s.requests[2].body:find("requires approval", 1, true))
+  end)
 end)

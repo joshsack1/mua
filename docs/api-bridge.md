@@ -177,9 +177,10 @@ recorded below:
   `ToolPre` args cJSON→Object, the seam takes Object→Lua.
 - **Store is core** ([autocmd.c](../src/mua/autocmd.c), singleton #5, `{id, event, LuaRef}`); the
   four dispatch seams live in the bridge (reuse the static `object_to_lua`). `mua_lua_tool_unref`
-  generalized to a shared `mua_lua_unref` ([lua/ref.h](../src/mua/lua/ref.h)). **Veto/rewrite
-  convention**: a `ToolPre` hook returns `false` (generic) or a string reason to veto, or a table to
-  rewrite the tool's arguments to that table; a throw is caught (nonfatal), neither veto nor rewrite.
+  generalized to a shared `mua_lua_unref` ([lua/ref.h](../src/mua/lua/ref.h)). **Veto/approve/rewrite
+  convention**: a `ToolPre` hook returns `false` (generic) or a string reason to veto, `true` to
+  approve the call outright (the base gate is skipped, so no y/N prompt), or a table to rewrite the
+  tool's arguments to that table; a throw is caught (nonfatal), none of the three.
 - The callback receives one table `{ event, ... }`; raw `mua_create_autocmd(event, callback)` is 1:1
   with C, and `mua.create_autocmd(event, {callback=})` is the nvim-shaped sugar.
 - **`ToolPre` argument rewrite** (follow-on): a table return rewrites the args, extending the gate.
@@ -189,6 +190,13 @@ recorded below:
   the prior rewrite via the shared payload `args`); a veto still wins. Approval is orthogonal — the
   rewritten args flow into the base gate, so a mutating tool still hits the y/N (now showing the
   rewrite). The grep→rg-hook use case, expressed in user `init.lua`.
+- **`ToolPre` approve outcome** (follow-on): a hook returning boolean `true` approves the call
+  outright. `mua_lua_autocmd_tool_pre` gained a `bool *approve_out` (a later veto still wins over an
+  approve); `gate_with_autocmds` returns `kGateApprove` before consulting `ctx->base_gate`, so the
+  call runs with no prompt regardless of the base policy (interactive / `-p`). Composes with rewrite
+  (approved + rewritten args run silently). The programmatic-allowlist seam — an opencode-style
+  permission policy in user `init.lua` returns `true` to allow, a string to deny, and `nil` to defer
+  to the normal gate.
 
 The original design follows (note: `ToolPre` ended up at the composing gate for *all* tools, not the
 mutating-only chokepoint, and `on_tool_start` was not used).
