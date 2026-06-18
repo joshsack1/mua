@@ -357,4 +357,18 @@ describe("the REPL", function()
     assert.truthy(s.requests[2].body:find("declined", 1, true))
     helpers.rm_rf(dir)
   end)
+
+  it("shows the command in the approval prompt, before the y/N", function()
+    local dir = helpers.tmpdir()
+    local call = { id = "call_g", name = "bash", arguments = '{"command":"echo hi"}' }
+    local srv = helpers.start_sse_server(tool_then_text(call, "ran it"))
+    local r = helpers.run_mua({}, helpers.mua_env(srv, dir), { stdin = "do it\ny\n" })
+    srv.finish()
+
+    -- Regression: the prompt used to show only the tool name, so the y/N came
+    -- before the command was ever printed. The command now renders in the prompt.
+    assert.truthy(r.stderr:find('allow bash {"command":"echo hi"}', 1, true))
+    assert.truthy(r.stderr:find('echo hi"}? [y/N]', 1, true)) -- command precedes the y/N
+    helpers.rm_rf(dir)
+  end)
 end)

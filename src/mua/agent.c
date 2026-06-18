@@ -17,6 +17,7 @@ enum {
   kAgentArgsCap = 1024 * 1024, // parse bound for one call's arguments string
   kAgentGateLine = 64,
   kAgentGateDrainMax = 8192, // overlong gate input drained up to this many bytes
+  kAgentGatePreview = 160,   // command preview shown in the approval prompt
 };
 
 struct AgentTurn {
@@ -660,7 +661,6 @@ GateDecision agent_gate_interactive(void *ud, const ToolDef *tool, const cJSON *
                                     cJSON **rewrite_out, char **refusal_out)
 {
   (void)ud;
-  (void)args;
   (void)rewrite_out;
   if (!tool->mutating) {
     return kGateApprove; // non-mutating tools (read) run without a prompt
@@ -668,7 +668,15 @@ GateDecision agent_gate_interactive(void *ud, const ToolDef *tool, const cJSON *
   // Blocking is sound here: nothing user-visible is in flight at gate time
   // (the provider stream is terminal, the prior tool fully closed, the next
   // tool unstarted); only curl keep-alive polling defers, harmlessly.
-  (void)fprintf(stderr, "mua: allow %s? [y/N] ", tool->name);
+  // The prompt must show the command being approved -- otherwise the y/N is
+  // answered before the command is ever printed. Capped like the on_tool_start
+  // chrome; data is NULL-guarded and xfree'd.
+  String preview = json_print(args);
+  int shown = (int)(preview.size < kAgentGatePreview ? preview.size : kAgentGatePreview);
+  (void)fprintf(stderr, "mua: allow %s %.*s%s? [y/N] ", tool->name, shown,
+                preview.data != NULL ? preview.data : "",
+                preview.size > kAgentGatePreview ? "..." : "");
+  xfree(preview.data);
   (void)fflush(stderr);
   char line[kAgentGateLine];
   if (fgets(line, sizeof line, stdin) == NULL) {
