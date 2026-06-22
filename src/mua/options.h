@@ -6,9 +6,13 @@
 // The agent options store: documented mutable singleton #3 (after the event
 // loop and the Lua state). Populated by init.lua before the agent runs -- via
 // mua_set_option, the public API over this -- and read during request build.
-// It is never mutated mid-run, so a pointer a turn borrows at its start stays
-// valid for the turn. options_free releases every stored copy and resets the
-// store to all-unset (also the unit-test isolation hook between cases).
+// The `model` option may also change *between* turns: a UserPromptPre hook can
+// reassign mua.o.model, so the REPL re-resolves and re-borrows the model at the
+// start of each turn (after UserPromptPre) and never retains a borrow across a
+// turn boundary. A pointer borrowed at a turn's start thus stays valid for that
+// turn even though the store can change between turns. options_free releases
+// every stored copy and resets the store to all-unset (also the unit-test
+// isolation hook between cases).
 
 // step_cap bounds, shared by the option table here and the agent's env clamp.
 enum { MUA_STEP_CAP_MIN = 1, MUA_STEP_CAP_MAX = 50 };

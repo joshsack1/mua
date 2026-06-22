@@ -348,11 +348,42 @@ static void drain_line(void)
   }
 }
 
-static int run_repl(HttpClient *http, SessionState *sess, const char *model, const char *api_key,
-                    int64_t context_length, bool yes)
+// NULL == NULL is equal; NULL vs non-NULL unequal; else strcmp. (model is NULL
+// when neither -m nor mua.o.model is set -> the provider default.)
+static bool cstr_eq_nullable(const char *a, const char *b)
+{
+  if (a == NULL || b == NULL) {
+    return a == b;
+  }
+  return strcmp(a, b) == 0;
+}
+
+// xstrdup that propagates NULL rather than dereferencing it.
+static char *xstrdup_or_null(const char *s)
+{
+  return s != NULL ? xstrdup(s) : NULL;
+}
+
+// Re-resolve the effective model for the turn about to run: CLI -m is an absolute
+// lock; otherwise the live mua.o.model, which a UserPromptPre hook may have just
+// changed. Borrowed from the options store -- valid only until the next
+// options_set of "model", so the caller must never retain it across a turn.
+static const char *resolve_turn_model(const char *cli_model)
+{
+  return cli_model != NULL ? cli_model : options_model_borrow();
+}
+
+static int run_repl(HttpClient *http, SessionState *sess, const char *cli_model,
+                    const char *api_key, int64_t context_length, bool ctx_len_locked, bool yes)
 {
   AgentGateFn gate = yes ? agent_gate_approve_all : agent_gate_interactive;
   (void)fprintf(stderr, "mua %s -- type 'exit' or Ctrl-D to quit\n", MUA_VERSION_STRING);
+  // ctx_model: an OWNED copy of the model `context_length` was last fetched for, so
+  // the per-turn change-check never dereferences a store borrow that a later
+  // mua.o.model assignment may have freed. Seeded with the startup model so the
+  // first turn refetches nothing.
+  char *ctx_model = xstrdup_or_null(resolve_turn_model(cli_model));
+  int code = kExitOk;
   char line[kReplLine];
   for (;;) {
     (void)fprintf(stderr, "mua> ");
@@ -360,7 +391,8 @@ static int run_repl(HttpClient *http, SessionState *sess, const char *model, con
     if (fgets(line, sizeof line, stdin) == NULL) {
       (void)fputc('\n', stderr);
       if (feof(stdin)) {
-        return kExitOk; // Ctrl-D
+        code = kExitOk;
+        goto cleanup; // Ctrl-D
       }
       clearerr(stdin); // Ctrl-C at the prompt: fresh line
       continue;
@@ -377,24 +409,37 @@ static int run_repl(HttpClient *http, SessionState *sess, const char *model, con
       continue; // empty line reprompts
     }
     if (strcmp(line, "exit") == 0 || strcmp(line, "quit") == 0) {
-      return kExitOk;
+      code = kExitOk;
+      goto cleanup;
     }
     // UserPromptPre runs before the turn (the input-side ToolPre): a hook may
-    // swallow the line (skip the turn) or rewrite it. `line` is a stack buffer; a
-    // rewrite is heap-owned and freed after the turn copies the text.
+    // swallow the line (skip the turn), rewrite it, or switch mua.o.model. `line`
+    // is a stack buffer; a rewrite is heap-owned and freed after the turn copies it.
     char *rewrite = NULL;
     if (mua_lua_autocmd_user_prompt_pre(line, &rewrite)) {
       xfree(rewrite); // swallowed: nothing to run, reprompt
       continue;
     }
     const char *text = rewrite != NULL ? rewrite : line;
+    // Re-resolve the model now, after UserPromptPre: a hook may have set
+    // mua.o.model, and a borrow held from a prior turn is now stale. Refetch the
+    // context-window budget only on an actual change (and when not env-locked).
+    const char *model = resolve_turn_model(cli_model);
+    if (!ctx_len_locked && !cstr_eq_nullable(model, ctx_model)) {
+      context_length = models_fetch_context_length(http, model, api_key, NULL);
+      xfree(ctx_model);
+      ctx_model = xstrdup_or_null(model);
+    }
     bool hard_stop = false;
-    int code = run_one_turn(http, sess, gate, model, api_key, context_length, text, &hard_stop);
+    code = run_one_turn(http, sess, gate, model, api_key, context_length, text, &hard_stop);
     xfree(rewrite); // NULL-safe; the turn copied the text into the session
     if (hard_stop) {
-      return code; // second SIGINT exits the REPL
+      goto cleanup; // second SIGINT exits the REPL
     }
   }
+cleanup:
+  xfree(ctx_model);
+  return code;
 }
 
 static int run_agent(const MuaArgs *args)
@@ -417,9 +462,11 @@ static int run_agent(const MuaArgs *args)
     (void)fprintf(stderr, "mua: %s\n", err.msg != NULL ? err.msg : "cannot open session");
     api_clear_error(&err);
   } else {
-    // Effective model: CLI -m wins, else mua.o.model from init.lua, else NULL
-    // (the provider default). The store outlives the turn, so borrowing is safe.
-    const char *model = args->model != NULL ? args->model : options_model_borrow();
+    // Startup model: CLI -m wins, else mua.o.model from init.lua, else NULL (the
+    // provider default). Used here only to seed the initial context-window fetch;
+    // each turn re-resolves it after UserPromptPre (resolve_turn_model), so a hook
+    // can switch models mid-session without this borrow dangling.
+    const char *model = resolve_turn_model(args->model);
     // The context-window budget needs the model's window. MUA_CONTEXT_LENGTH is
     // a per-invocation override (and the test seam): when set it wins (0 there
     // disables the budget); otherwise fetch it from the catalog once. A failed
@@ -435,6 +482,9 @@ static int run_agent(const MuaArgs *args)
     } else {
       context_length = models_fetch_context_length(http, model, api_key, NULL);
     }
+    // MUA_CONTEXT_LENGTH set => env-locked: the REPL must not auto-refetch the
+    // budget when a hook switches models (mirrors the startup decision above).
+    bool ctx_len_locked = (env_ctx != NULL && env_ctx[0] != '\0');
     session_set_current(sess); // register the run's session so hooks resolve `0`
     mua_lua_autocmd_session(kAutocmdSessionStart, session_id(sess));
     if (args->prompt != NULL) {
@@ -446,13 +496,17 @@ static int run_agent(const MuaArgs *args)
         code = kExitOk;
       } else {
         const char *text = rewrite != NULL ? rewrite : args->prompt;
+        // Re-resolve after UserPromptPre: a hook may have set mua.o.model, leaving
+        // the startup borrow above dangling. context_length keeps the launch
+        // model's window (a single turn; the step cap still bounds the loop).
+        model = resolve_turn_model(args->model);
         AgentGateFn gate = args->yes ? agent_gate_approve_all : agent_gate_auto_refuse;
         bool hard_stop = false;
         code = run_one_turn(http, sess, gate, model, api_key, context_length, text, &hard_stop);
         xfree(rewrite); // NULL-safe; the turn copied the text
       }
     } else {
-      code = run_repl(http, sess, model, api_key, context_length, args->yes);
+      code = run_repl(http, sess, args->model, api_key, context_length, ctx_len_locked, args->yes);
     }
     mua_lua_autocmd_session(kAutocmdSessionEnd, session_id(sess));
     session_set_current(NULL); // clear the borrow before the SessionState is freed
