@@ -426,7 +426,7 @@ static int run_repl(HttpClient *http, SessionState *sess, const char *cli_model,
     // context-window budget only on an actual change (and when not env-locked).
     const char *model = resolve_turn_model(cli_model);
     if (!ctx_len_locked && !cstr_eq_nullable(model, ctx_model)) {
-      context_length = models_fetch_context_length(http, model, api_key, NULL);
+      context_length = models_context_length(http, model, api_key);
       xfree(ctx_model);
       ctx_model = xstrdup_or_null(model);
     }
@@ -480,7 +480,7 @@ static int run_agent(const MuaArgs *args)
         context_length = (int64_t)value;
       }
     } else {
-      context_length = models_fetch_context_length(http, model, api_key, NULL);
+      context_length = models_context_length(http, model, api_key);
     }
     // MUA_CONTEXT_LENGTH set => env-locked: the REPL must not auto-refetch the
     // budget when a hook switches models (mirrors the startup decision above).
@@ -544,7 +544,8 @@ static int run(const MuaArgs *args)
   tools_teardown();   // unref Lua tool callbacks while the state is still alive
   autocmd_teardown(); // likewise for autocmd callbacks
   mua_lua_teardown();
-  options_free(); // release option copies set from init.lua
+  options_free();      // release option copies set from init.lua
+  models_cache_free(); // release the model-catalog cache (singleton #8)
   if (!loop_close() && code == kExitOk) {
     code = kExitFailure;
   }

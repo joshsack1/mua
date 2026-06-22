@@ -74,4 +74,43 @@ describe("mid-session model switch", function()
     assert.equal(1, #s.requests)
     assert.truthy(s.requests[1].body:find('"model":"model-b"', 1, true))
   end)
+
+  it("fetches the /models catalog once and reuses it across a switch", function()
+    -- One block per connection, in order: the startup GET /models, then turn 1
+    -- (model-a), then turn 2 (model-b). A working cache means the switch does NOT
+    -- trigger a second catalog fetch -- exactly one GET /models among the requests.
+    local dir = helpers.tmpdir()
+    local catalog = '{"data":['
+      .. '{"id":"model-a","context_length":128000},'
+      .. '{"id":"model-b","context_length":200000}]}'
+    local models_block = {
+      {
+        "send",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n" .. catalog,
+      },
+      { "close" },
+    }
+    local function turn(t)
+      return { { "send", helpers.text_block(t) }, { "close" } }
+    end
+    local srv = helpers.start_sse_server({ models_block, turn("one"), turn("two") }, { timeout_ms = 4000 })
+    local env = helpers.mua_env(srv, dir)
+    env.MUA_CONFIG_DIR = FIX
+    env.MUA_CONTEXT_LENGTH = nil -- enable the startup catalog fetch (mua_env sets "0" otherwise)
+    local r = helpers.run_mua({}, env, { stdin = "hello\n/model B\nhello again\nexit\n" })
+    local s = srv.finish()
+    helpers.rm_rf(dir)
+
+    assert.equal(0, r.code)
+    assert.equal(3, #s.requests) -- one /models + two turns; the switch did not refetch
+    local models_fetches = 0
+    for _, req in ipairs(s.requests) do
+      if req.method == "GET" and req.path == "/models" then
+        models_fetches = models_fetches + 1
+      end
+    end
+    assert.equal(1, models_fetches) -- catalog fetched once, reused across the switch
+    assert.truthy(s.requests[2].body:find('"model":"model-a"', 1, true))
+    assert.truthy(s.requests[3].body:find('"model":"model-b"', 1, true))
+  end)
 end)
