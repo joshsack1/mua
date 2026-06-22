@@ -39,6 +39,7 @@ make lint             # clang-tidy on C, luacheck on Lua
 make format           # clang-format on C, stylua on Lua
 TEST_FILE=test/functional/startup_spec.lua make functionaltest   # run a single spec file
 make SANITIZE=1 BUILD_DIR=build-san test   # the suites under ASan+UBSan (second gear)
+make CMAKE_BUILD_TYPE=Release BUILD_DIR=build-rel test  # the suites at -O3/NDEBUG (third gear: catches optimization-only UB the Debug/ASan builds miss)
 ```
 
 CMake never invoked directly except for debugging the build itself. Dependencies (LuaJIT, libuv, libcurl) are found on the system first; a `cmake.deps`-style bundled fallback can come later if needed.
